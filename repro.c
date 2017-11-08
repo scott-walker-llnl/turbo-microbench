@@ -17,6 +17,7 @@ struct thread_data
 	unsigned num_alu;
 	uint64_t *perf_data;
 	uint64_t *tsc_data;
+	uint64_t *ctl_data;
 	unsigned long loc;
 };
 
@@ -25,7 +26,7 @@ void alu_workload(const unsigned iter);
 
 // prototypes
 void work(void *data);
-void push_data(const uint64_t data, const uint64_t tsc, struct thread_data *tdat);
+void push_data(const uint64_t data, const uint64_t ctl, const uint64_t tsc, struct thread_data *tdat);
 void dump_data(const FILE *dest, const struct thread_data *tdat);
 void perf_sample(struct thread_data *tdat);
 void set_perf(const unsigned freq, const unsigned tid);
@@ -82,12 +83,21 @@ int main(int argc, char **argv)
 			fprintf(stderr, "ERROR: not enough memory\n");
 			return -1;
 		}
+
 		tdat[itr].tsc_data = (uint64_t *) malloc(num_iterations * 2 * sizeof(uint64_t));
 		if (tdat[itr].tsc_data == NULL)
 		{
 			fprintf(stderr, "ERROR: not enough memory\n");
 			return -1;
 		}
+
+	tdat[itr].ctl_data = (uint64_t *) malloc(num_iterations * 2 * sizeof(uint64_t));
+		if (tdat[itr].ctl_data == NULL)
+		{
+			fprintf(stderr, "ERROR: not enough memory\n");
+			return -1;
+		}
+
 		tdat[itr].tid = itr;
 		tdat[itr].niter = num_iterations;
 		tdat[itr].num_alu = num_alu;
@@ -193,7 +203,7 @@ void check_hwp()
 	}
 }
 
-void push_data(const uint64_t data, const uint64_t tsc, struct thread_data *tdat)
+void push_data(const uint64_t data, const uint64_t ctl, const uint64_t tsc, struct thread_data *tdat)
 {
 	if (tdat->perf_data == NULL)
 	{
@@ -205,15 +215,17 @@ void push_data(const uint64_t data, const uint64_t tsc, struct thread_data *tdat
 	}
 	tdat->perf_data[tdat->loc] = data;
 	tdat->tsc_data[tdat->loc] = tsc;
+	tdat->ctl_data[tdat->loc] = ctl;
 	tdat->loc++;
 }
 
 void dump_data(const FILE *dest, const struct thread_data *tdat)
 {
 	int itr;
+	fprintf((FILE * __restrict__) dest, "Freq\tPERF_STATUS\tTSC\tPERF_CTL\n");
 	for (itr = 0; itr < tdat->loc; itr++)
 	{
-		fprintf((FILE * __restrict__) dest, "%f\t%lx\t%lu\n", ((float) ((tdat->perf_data[itr] & (0xFFFF)) >> 8)) / 10.0, (unsigned long) (tdat->perf_data[itr]), tdat->tsc_data[itr] - tdat->tsc_data[0]);
+		fprintf((FILE * __restrict__) dest, "%f\t%lx\t%lu\t%lx\n", ((float) ((tdat->perf_data[itr] & (0xFFFF)) >> 8)) / 10.0, (unsigned long) (tdat->perf_data[itr]), tdat->tsc_data[itr] - tdat->tsc_data[0], (unsigned long) tdat->ctl_data[itr]);
 	}
 }
 
@@ -229,16 +241,18 @@ void set_perf(const unsigned freq, const unsigned tid)
 	freq_mask = freq;
 	freq_mask <<= 8;
 	perf_ctl |= freq_mask;
-	printf("Requesting P-State %.1fGHz (PERF_CTL[0:15] = %lx)\n", (float) freq / 10.0, (unsigned long) perf_ctl & 0xffff);
+	printf("Requesting P-State %.1fGHz (PERF_CTL[0:15] = 0x%lx)\n", (float) freq / 10.0, (unsigned long) perf_ctl & 0xffff);
 	write_msr_by_coord(0, tid, 0, IA32_PERF_CTL, perf_ctl);
 }
 
 inline void perf_sample(struct thread_data *tdat)
 {
 	uint64_t perf_status;
+	uint64_t perf_ctl;
 	static float last_freq = PSTATE / 10.0;
 	static int first_catch = 1;
 	read_msr_by_coord(0, tdat->tid, 0, IA32_PERF_STATUS, &perf_status);
+	read_msr_by_coord(0, tdat->tid, 0, IA32_PERF_CTL, &perf_ctl);
 	float freq = ((perf_status & 0xffff) >> 8) / 10.0;
 	if ((perf_status & 0xffff) >> 8 != PSTATE && first_catch)
 	{
@@ -253,7 +267,7 @@ inline void perf_sample(struct thread_data *tdat)
 	}
 	uint64_t tsc;
 	read_msr_by_coord(0, tdat->tid, 0, 0x10, &tsc);
-	push_data(perf_status, tsc, tdat);
+	push_data(perf_status, perf_ctl, tsc, tdat);
 }
 
 void work(void *data)
