@@ -1,5 +1,5 @@
-INCLUDES_PATH=/home/walker8/lib/include
-LIBS_PATH=/home/walker8/lib/lib
+INCLUDES_PATH=/home/walker8/libmsr/install/include
+LIBS_PATH=/home/walker8/libmsr/install/lib
 
 turbo: turbo.c
 	gcc -O3 -pthread -Wall -L${LIBS_PATH} -lmsr -I${INCLUDES_PATH} turbo.c -o turbo

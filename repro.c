@@ -277,10 +277,7 @@ void work(void *data)
 	CPU_ZERO(&cpus);
 	CPU_SET(tdat->tid, &cpus);
 	sched_setaffinity(getpid(), sizeof(cpus), &cpus);
-	if (!tdat->tid)
-	{
-		set_perf(PSTATE, tdat->tid);
-	}
+	set_perf(PSTATE, tdat->tid);
 	int i;
 	for (i = 0; i < tdat->niter; i++)
 	{

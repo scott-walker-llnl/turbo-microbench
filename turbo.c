@@ -8,6 +8,8 @@
 #include "msr_core.h"
 #include "master.h"
 
+#define MSR_TURBO_RATIO_LIMIT 0x1AD
+
 struct thread_data
 {
 	unsigned tid;
@@ -33,6 +35,8 @@ void disable_turbo();
 void enable_turbo();
 void set_perf(const unsigned freq, const unsigned tid);
 void load_dummy(const unsigned tid);
+void read_turbo_limit();
+void set_turbo_limit(unsigned int limit);
 
 int main(int argc, char **argv)
 {
@@ -56,6 +60,9 @@ int main(int argc, char **argv)
 	unsigned num_iterations = (unsigned) atoi(argv[2]);
 	unsigned num_alu = (unsigned) atoi(argv[3]);
 	unsigned num_nop = (unsigned) atoi(argv[4]);
+
+	read_turbo_limit();
+	set_turbo_limit(0x28);
 
 	struct thread_data *tdat = (struct thread_data *) calloc(num_threads, sizeof(struct thread_data));
 	if (tdat == NULL)
@@ -103,6 +110,26 @@ int main(int argc, char **argv)
 	}
 	finalize_msr();
 	return 0;
+}
+
+void read_turbo_limit()
+{
+	uint64_t turbo_limit;
+	read_msr_by_coord(0, 0, 0, MSR_TURBO_RATIO_LIMIT, &turbo_limit);
+
+	printf("1 core: %x\n", (turbo_limit & 0xFF));
+	printf("2 core: %x\n", ((turbo_limit >> 8) & 0xFF));
+	printf("3 core: %x\n", ((turbo_limit >> 8) & 0xFF));
+	printf("4 core: %x\n", ((turbo_limit >> 8) & 0xFF));
+}
+
+void set_turbo_limit(unsigned int limit)
+{
+	uint64_t turbo_limit;
+	limit &= 0xFF;
+	turbo_limit = 0x0 | (limit) | (limit << 8) | (limit << 16) | (limit << 24);
+	printf("set turbo limit %lx\n", (unsigned long) turbo_limit);
+	write_msr_by_coord(0, 0, 0, MSR_TURBO_RATIO_LIMIT, turbo_limit);
 }
 
 void push_data(const uint64_t data, const uint64_t tsc, struct thread_data *tdat)
