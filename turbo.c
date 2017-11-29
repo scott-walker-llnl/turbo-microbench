@@ -77,8 +77,8 @@ int main(int argc, char **argv)
 	sigaction(SIGUSR1, &action, NULL);
 
 	sigset_t sset;
-	gitemptyset(&sset);
-	sigaddset(&ssed, SIGUSR1);
+	sigemptyset(&sset);
+	sigaddset(&sset, SIGUSR1);
 	int hstat = pthread_sigmask(SIG_UNBLOCK, &sset, NULL);
 	if (hstat != 0)
 	{
@@ -262,8 +262,6 @@ void set_rapl(unsigned sec, double watts, double pu, double su, unsigned affinit
 	write_msr_by_coord(0, 0, 0, MSR_PKG_POWER_LIMIT, rapl);
 }
 
-
-
 void push_data(const uint64_t data, const uint64_t tsc, struct thread_data *tdat)
 {
 	tdat->perf_data[tdat->loc] = data;
@@ -366,7 +364,7 @@ void send_sigusr(unsigned numthreads, pthread_t *threads)
 	int i;
 	for (i = 0; i < numthreads; i++)
 	{
-		pthread_kill(threads[itr], SIGUSR1);
+		pthread_kill(threads[i], SIGUSR1);
 	}
 }
 
@@ -4996,10 +4994,10 @@ int asm_work_skl_corei_fma_1t(threaddata_t* threaddata)
 	//"subq $1000000, %%r13;"
 	// quarter second
 	//"subq $500000, %%r13;"
-	"subq $50000, %%r13;"
+	//"subq $50000, %%r13;"
 	//"subq $1000, %%r13;"
 	// 250 us
-	//"subq $500, %%r13;"
+	"subq $500, %%r13;"
 	// 25 us
 	//"subq $50, %%r13;"
 	//"subq $20, %%r13;"
