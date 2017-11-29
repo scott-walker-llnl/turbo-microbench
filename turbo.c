@@ -3,6 +3,7 @@
 #include <stdio.h>
 #include <stdlib.h>
 #include <stdint.h>
+#include <signal.h>
 #include <pthread.h>
 #include <unistd.h>
 #include <sched.h>
@@ -41,7 +42,11 @@ struct thread_data
 	uint64_t *tsc_data;
 	unsigned long loc;
 	threaddata_t *threaddata;
+	unsigned num_threads;
+	pthread_t *threads;
 };
+
+unsigned int TLIM;
 
 // workloads
 void nop_workload(const unsigned iter);
@@ -62,9 +67,24 @@ void set_turbo_limit(unsigned int limit);
 void set_rapl(unsigned sec, double watts, double pu, double su, unsigned affinity);
 int asm_work_skl_corei_fma_1t(threaddata_t* threaddata) __attribute__((noinline));
 int init_skl_corei_fma_1t(threaddata_t* threaddata) __attribute__((noinline));
+void signal_turbo_change(int signum);
 
 int main(int argc, char **argv)
 {
+	struct sigaction action;
+	memset(&action, 0, sizeof(struct sigaction));
+	action.sa_handler = signal_turbo_change;
+	sigaction(SIGUSR1, &action, NULL);
+
+	sigset_t sset;
+	gitemptyset(&sset);
+	sigaddset(&ssed, SIGUSR1);
+	int hstat = pthread_sigmask(SIG_UNBLOCK, &sset, NULL);
+	if (hstat != 0)
+	{
+		fprintf(stderr, "ERROR: unable to set signal mask\n");
+		return -1;
+	}
 	if (argc != 5)
 	{
 		fprintf(stderr, "ERROR: run as so './turbo <num threads> <num iterations> <num alu> <num nop>'\n");
@@ -157,6 +177,8 @@ int main(int argc, char **argv)
 		tdat[itr].niter = num_iterations;
 		tdat[itr].num_alu = num_alu;
 		tdat[itr].num_nop = num_nop;
+		tdat[itr].num_threads = num_threads;
+		tdat[itr].threads = threads;
 		pthread_create(&threads[itr], NULL, (void *) &work, (void *) &tdat[itr]);
 	}
 	for (itr = 0; itr < num_threads; itr++)
@@ -175,6 +197,17 @@ int main(int argc, char **argv)
 	free(barrierdat);
 	finalize_msr();
 	return 0;
+}
+
+void signal_turbo_change(int signum)
+{
+	if (signum != SIGUSR1)
+	{
+		fprintf(stderr, "child received wrong signal!\n");
+		return;
+	}
+	set_turbo_limit(TLIM);
+	return;
 }
 
 void read_turbo_limit()
@@ -328,6 +361,15 @@ void barrier(unsigned affinity, threaddata_t *threaddata)
     }
 }
 
+void send_sigusr(unsigned numthreads, pthread_t *threads)
+{
+	int i;
+	for (i = 0; i < numthreads; i++)
+	{
+		pthread_kill(threads[itr], SIGUSR1);
+	}
+}
+
 void work(void *data)
 {
 	struct thread_data *tdat = (struct thread_data *) data;
@@ -342,13 +384,17 @@ void work(void *data)
 	for (i = 0; i < tdat->niter; i++)
 	{
 		//nop_workload(tdat->num_nop);
-		if (i == tdat->num_alu)
+		if (i == tdat->num_alu && tdat->tid == 0)
 		{
-			set_turbo_limit(0x2A);
+			//set_turbo_limit(0x2A);
+			TLIM = 0x2A;
+			send_sigusr(tdat->num_threads, tdat->threads);
 		}
-		if (i == tdat->num_nop)
+		if (i == tdat->num_nop && tdat->tid == 0)
 		{
-			set_turbo_limit(0x2D);
+			//set_turbo_limit(0x2D);
+			TLIM = 0x2D;
+			send_sigusr(tdat->num_threads, tdat->threads);
 		}
 		asm_work_skl_corei_fma_1t(tdat->threaddata);
 		perf_sample(tdat);
