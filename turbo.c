@@ -8,6 +8,7 @@
 #include <unistd.h>
 #include <sched.h>
 #include <math.h>
+#include <sys/time.h>
 #include <xmmintrin.h>
 #include "msr_core.h"
 #include "master.h"
@@ -16,6 +17,8 @@
 #define LOAD_HIGH 1
 #define INIT_BLOCKSIZE 8192
 #define EXIT_SUCCESS 0
+#define FREQ_HIGH (0x2B)
+#define LOW_FREQ (0x2A)
 
 // used by firestarter
 typedef struct threaddata_t
@@ -57,7 +60,7 @@ void fence_workload(const unsigned iter);
 void work(void *data);
 void push_data(const uint64_t data, const uint64_t tsc, struct thread_data *tdat);
 void dump_data(const FILE *dest, const struct thread_data *tdat);
-void perf_sample(struct thread_data *tdat);
+int perf_sample(struct thread_data *tdat);
 void disable_turbo();
 void enable_turbo();
 void set_perf(const unsigned freq, const unsigned tid);
@@ -68,6 +71,7 @@ void set_rapl(unsigned sec, double watts, double pu, double su, unsigned affinit
 int asm_work_skl_corei_fma_1t(threaddata_t* threaddata) __attribute__((noinline));
 int init_skl_corei_fma_1t(threaddata_t* threaddata) __attribute__((noinline));
 void signal_turbo_change(int signum);
+void dump_rapl();
 
 int main(int argc, char **argv)
 {
@@ -106,6 +110,8 @@ int main(int argc, char **argv)
 	int ALIGNMENT = 64;
 	BUFFERSIZEMEM = sizeof(char) * (2 * BUFFERSIZE[0] + BUFFERSIZE[1] + BUFFERSIZE[2] + RAMBUFFERSIZE + ALIGNMENT + 2 * sizeof(unsigned long long));
 
+	dump_rapl();
+
 	uint64_t unit;
 	read_msr_by_coord(0, 0, 0, MSR_RAPL_POWER_UNIT, &unit);
 	uint64_t power_unit = unit & 0xF;
@@ -116,6 +122,7 @@ int main(int argc, char **argv)
 	fprintf(stderr, "seconds unit: %lx\n", seconds_unit);
 
 	set_rapl(1, 91.0, pu, su, 0);
+	dump_rapl();
 
 	unsigned num_threads = (unsigned) atoi(argv[1]);
 	pthread_t *threads = (pthread_t *) malloc(num_threads * sizeof(pthread_t));
@@ -127,7 +134,7 @@ int main(int argc, char **argv)
 	unsigned num_nop = (unsigned) atoi(argv[4]);
 
 	read_turbo_limit();
-	set_turbo_limit(0x2D);
+	set_turbo_limit(FREQ_HIGH);
 
 	struct thread_data *tdat = (struct thread_data *) calloc(num_threads, sizeof(struct thread_data));
 	if (tdat == NULL)
@@ -319,13 +326,18 @@ void disable_turbo(const unsigned tid)
 	write_msr_by_coord(0, tid, 0, IA32_PERF_CTL, perf_ctl);
 }
 
-inline void perf_sample(struct thread_data *tdat)
+inline int perf_sample(struct thread_data *tdat)
 {
 	uint64_t perf_status;
 	read_msr_by_coord(0, tdat->tid, 0, IA32_PERF_STATUS, &perf_status);
 	uint64_t tsc;
 	read_msr_by_coord(0, tdat->tid, 0, 0x10, &tsc);
 	push_data(perf_status, tsc, tdat);
+	if ((perf_status & 0xFFFF) == 0x2A00)
+	{
+		return 1;
+	}
+	return 0;
 }
 
 inline void disable_rapl()
@@ -374,33 +386,76 @@ void work(void *data)
 	cpu_set_t cpus;
 	CPU_ZERO(&cpus);
 	CPU_SET(tdat->tid, &cpus);
-	sched_setaffinity(getpid(), sizeof(cpus), &cpus);
+	sched_setaffinity(0, sizeof(cpus), &cpus);
+	sleep(0.25);
 
-	barrier(tdat->tid, tdat->threaddata);
+	uint64_t power_pre;
+	struct timeval time1;
+	if (tdat->tid == 0)
+	{
+		read_msr_by_coord(0, 0, 0, MSR_PKG_ENERGY_STATUS, &power_pre);
+		power_pre &= 0xFFFFFFFFFFFFul;
+		gettimeofday(&time1, NULL);
+	}
+	//barrier(tdat->tid, tdat->threaddata);
 	
+	int phase_end = 0;
+	int phase_start = 0;
 	int i;
 	for (i = 0; i < tdat->niter; i++)
 	{
 		//nop_workload(tdat->num_nop);
 		if (i == tdat->num_alu && tdat->tid == 0)
 		{
-			//set_turbo_limit(0x2A);
-			TLIM = 0x2A;
+			TLIM = LOW_FREQ;
+			//set_turbo_limit(TLIM);
 			send_sigusr(tdat->num_threads, tdat->threads);
 		}
 		if (i == tdat->num_nop && tdat->tid == 0)
 		{
-			//set_turbo_limit(0x2D);
-			TLIM = 0x2D;
+			TLIM = FREQ_HIGH;
+			//set_turbo_limit(TLIM);
 			send_sigusr(tdat->num_threads, tdat->threads);
+			phase_end = 1;
 		}
 		asm_work_skl_corei_fma_1t(tdat->threaddata);
-		perf_sample(tdat);
-		//if (i % 4000)
-		//{
-		//	barrier(tdat->tid, tdat->threaddata);
-		//}
+		int ret = perf_sample(tdat);
+		if (phase_end == 1 && tdat->tid == 0 && ret == 1)
+		{
+			TLIM = LOW_FREQ;
+			send_sigusr(tdat->num_threads, tdat->threads);
+			phase_start = i;
+			phase_end = 0;
+		}
+		if (tdat->tid == 0 && 
+			i == phase_start + (tdat->num_nop - tdat->num_alu))
+		{
+			TLIM = FREQ_HIGH;
+			send_sigusr(tdat->num_threads, tdat->threads);
+			phase_end = 1;
+		}
 	}
+	uint64_t power_post;
+	struct timeval time2;
+	if (tdat->tid == 0)
+	{
+		read_msr_by_coord(0, 0, 0, MSR_PKG_ENERGY_STATUS, &power_post);
+		power_post &= 0xFFFFFFFFFFFFul;
+		uint64_t unit;
+		read_msr_by_coord(0, 0, 0, MSR_RAPL_POWER_UNIT, &unit);
+		double energy_unit = 1.0 / (0x1 << ((unit & 0x1F00) >> 8));
+		gettimeofday(&time2, NULL);
+		double time = time2.tv_sec - time1.tv_sec + (time2.tv_usec - time1.tv_usec) / 1000000;
+		if (power_post < power_pre)
+		{
+			fprintf(stderr, "power consumed: %lf\n", (double) (((0xFFFFFFFFFFFFul - power_pre) + power_post) * energy_unit) / time);
+		}
+		else
+		{
+			fprintf(stderr, "power consumed: %lf\n", (double) ((power_post - power_pre) * energy_unit) / time);
+		}
+	}
+
 }
 
 void fence_workload(const unsigned iter)
