@@ -1,76 +1,111 @@
 args = commandArgs(trailingOnly=TRUE)
-if (length(args) != 2)
+if (length(args) != 3)
 {
 	print("bad arguments")
 	q()
 }
 notstart <- as.numeric(args[1])
 notend <- as.numeric(args[2])
+path <- args[3]
+fstart = 4.5
 
-fname <- "core0.msrdat"
+fname <- paste(path, "core0.msrdat", sep="/")
 alldat <- read.csv(fname, header=TRUE, sep="\t")
 
 dp = as.data.frame(alldat)
-avgfrq = c()
+avgfrq1 = c()
 
 tscbefore = dp[notstart, 3]
 for (n in seq(from=notstart, to=notend, by=1))
 {
-	avgfrq = c(dp[n, 1], avgfrq)
+	avgfrq1 = c(dp[n, 1], avgfrq1)
 }
 tscafter = dp[notend, 3]
 
-nottime = (tscafter - tscbefore) / (mean(avgfrq) * 1000000000)
+nottime = (tscafter - tscbefore) / (mean(avgfrq1) * 1000000000)
 print(paste("no turbo time", nottime, "seconds", sep=" "))
 
-tscbefore = tscafter
 itr = notend
-avgfrq = c()
-while (dp[itr, 1] == 4.5)
+check = 4.5
+if (fstart >= check)
 {
-	avgfrq = c(dp[n, 1], avgfrq)
-	itr = itr + 1
+	tscbefore = tscafter
+	avgfrq2 = c()
+	while (dp[itr, 1] == 4.5)
+	{
+		avgfrq2 = c(dp[n, 1], avgfrq2)
+		itr = itr + 1
+	}
+	tscafter = dp[itr, 3]
+	tempmean = mean(avgfrq2)
+	if (is.na(tempmean))
+	{
+		ttime5 = 0.0
+	} else {
+		ttime5 = (tscafter - tscbefore) / (tempmean * 1000000000)
+	}
+	print(paste("turbo time 4.5GHz", sprintf("%.6f", ttime5), "seconds", sep=" "))
 }
-tscafter = dp[itr, 3]
-ttime5 = (tscafter - tscbefore) / (mean(avgfrq) * 1000000000)
 
-print(paste("turbo time 4.5GHz", ttime5, "seconds", sep=" "))
+check = 4.4
+if (fstart >= check)
+{
+	tscbefore = tscafter
+	avgfrq3 = c()
+	while (dp[itr, 1] == 4.4)
+	{
+		avgfrq3 = c(dp[n, 1], avgfrq3)
+		itr = itr + 1
+	}
+	tscafter = dp[itr, 3]
+	tempmean = mean(avgfrq3)
+	if (is.na(tempmean))
+	{
+		ttime4 = 0.0
+	} else {
+		ttime4 = (tscafter - tscbefore) / (tempmean * 1000000000)
+	}
+	print(paste("turbo time 4.4GHz", sprintf("%.6f", ttime4), "seconds", sep=" "))
+}
+
+check = 4.3
+if (fstart >= check)
+{
+	tscbefore = tscafter
+	avgfrq4 = c()
+	while (dp[itr, 1] == 4.3)
+	{
+		avgfrq4 = c(dp[n, 1], avgfrq4)
+		itr = itr + 1
+	}
+	tscafter = dp[itr, 3]
+	tempmean = mean(avgfrq4)
+	if (is.na(tempmean))
+	{
+		ttime3 = 0.0
+	} else {
+		ttime3 = (tscafter - tscbefore) / (tempmean * 1000000000)
+	}
+	print(paste("turbo time 4.3GHz", sprintf("%.6f", ttime3), "seconds", sep=" "))
+}
 
 tscbefore = tscafter
-avgfrq = c()
-while (dp[itr, 1] == 4.4)
-{
-	avgfrq = c(dp[n, 1], avgfrq)
-	itr = itr + 1
-}
-tscafter = dp[itr, 3]
-ttime4 = (tscafter - tscbefore) / (mean(avgfrq) * 1000000000)
-
-print(paste("turbo time 4.4GHz", ttime4, "seconds", sep=" "))
-
-tscbefore = tscafter
-avgfrq = c()
-while (dp[itr, 1] == 4.3)
-{
-	avgfrq = c(dp[n, 1], avgfrq)
-	itr = itr + 1
-}
-tscafter = dp[itr, 3]
-ttime3 = (tscafter - tscbefore) / (mean(avgfrq) * 1000000000)
-
-print(paste("turbo time 4.3GHz", ttime4, "seconds", sep=" "))
-
-tscbefore = tscafter
-avgfrq = c()
+avgfrq5 = c()
 while (dp[itr, 1] == 4.2)
 {
-	avgfrq = c(dp[n, 1], avgfrq)
+	avgfrq5 = c(dp[n, 1], avgfrq5)
 	itr = itr + 1
 }
 tscafter = dp[itr, 3]
-ttime2 = (tscafter - tscbefore) / (mean(avgfrq) * 1000000000)
+tempmean = mean(avgfrq5)
+if (is.na(tempmean))
+{
+	ttime2 = 0.0
+} else {
+	ttime2 = (tscafter - tscbefore) / (tempmean * 1000000000)
+}
 
-print(paste("turbo time 4.2GHz", ttime4, "seconds", sep=" "))
+print(paste("turbo time 4.2GHz", sprintf("%.6f", ttime2), "seconds", sep=" "))
 
 print(paste("end freq" , dp[itr, 1], sep=" "))
 
@@ -92,5 +127,5 @@ print(paste("end freq" , dp[itr, 1], sep=" "))
 #print(length(dp[, 1]))
 
 png("fplot.png", width=1270, height=768)
-plot(dp[, 3], dp[, 1], ylab = "freq", xlab = "time", type="line", xaxs="i", yaxs="i", col="blue")
+plot(dp[, 3], dp[, 1], ylab = "freq", xlab = "time", type="l", xaxs="i", yaxs="i", col="blue")
 dev.off()
