@@ -21,19 +21,20 @@ struct data_sample
 
 struct data_sample **thread_samples;
 unsigned THREADCOUNT;
-unsigned long SAMPLECTR = 0;
+unsigned long *SAMPLECTRS;
 
 int fence_workload(unsigned iter);
 
 int sample_data(int tid)
 {
+	//fprintf(stderr, "thread %d sample %lu\n", tid, SAMPLECTRS[tid]);
 	if (tid > THREADCOUNT)
 	{
 		return -1;
 	}
-	read_msr_by_coord(0, tid, 0, IA32_PERF_STATUS, &(thread_samples[tid][SAMPLECTR].frq_data));
-	read_msr_by_coord(0, tid, 0, IA32_TIME_STAMP_COUNTER, &(thread_samples[tid][SAMPLECTR].tsc_data));
-	SAMPLECTR++;
+	read_msr_by_coord(0, tid, 0, IA32_PERF_STATUS, &(thread_samples[tid][SAMPLECTRS[tid]].frq_data));
+	read_msr_by_coord(0, tid, 0, IA32_TIME_STAMP_COUNTER, &(thread_samples[tid][SAMPLECTRS[tid]].tsc_data));
+	SAMPLECTRS[tid]++;
 	return 0;
 }
 
@@ -42,7 +43,7 @@ void dump_data(FILE **outfile, unsigned long numsamples)
 	int j;
 	for (j = 0; j < THREADCOUNT; j++)
 	{
-		fprintf(outfile[j], "p-state\ttsc");
+		fprintf(outfile[j], "p-state\ttsc\n");
 		unsigned long i;
 		for (i = 0; i < numsamples; i++)
 		{
@@ -54,10 +55,10 @@ void dump_data(FILE **outfile, unsigned long numsamples)
 
 int main(int argc, char **argv)
 {
-	if (argc < 4)
+	if (argc < 5)
 	{
 		fprintf(stderr, "ERROR: bad arguments\n");
-		fprintf(stderr, "Usage: ./t <threads> <duration in seconds> <samples per second>");
+		fprintf(stderr, "Usage: ./t <threads> <duration in seconds> <samples per second> <sleep duty %%>\n");
 		return -1;
 	}
 
@@ -67,57 +68,81 @@ int main(int argc, char **argv)
 		return -1;
 	}
 
+	THREADCOUNT = (unsigned) atoi(argv[1]);
 	unsigned duration = (unsigned) atoi(argv[2]);
 	unsigned sps = (unsigned) atoi(argv[3]);
-	unsigned srate = 1000 / sps;
-	THREADCOUNT = (unsigned) atoi(argv[1]);
+	unsigned sleep_percent = (unsigned) atoi(argv[4]);
+	unsigned srate = (1000 / sps) * 1000;
+	unsigned workduty = (unsigned) ((float) srate * ((100.0 - sleep_percent) / 100.0));
+	unsigned sleepduty = (unsigned) ((float) srate * (sleep_percent / 100.0));
+	fprintf(stdout, "Using paremeters:\n");
+	fprintf(stdout, "\tThreads: %u\n", THREADCOUNT);
+	fprintf(stdout, "\tTime: %u\n", duration);
+	fprintf(stdout, "\tSamples Per Second: %u\n", sps);
+	fprintf(stdout, "\tWork Duty(microseconds): %u\n", workduty);
+	fprintf(stdout, "\tSleep Duty(microseconds): %u\n", sleepduty);
+
 	thread_samples = (struct data_sample **) calloc(THREADCOUNT, sizeof(struct data_sample *));
 	FILE **output = (FILE **) calloc(THREADCOUNT, sizeof(FILE *));
+	SAMPLECTRS = (unsigned long *) calloc(THREADCOUNT, sizeof(unsigned long));
 	unsigned long numsamples = duration * sps;
 	char fname[FNAMESIZE];
 	int i;
 	for (i = 0; i < THREADCOUNT; i++)
 	{
-		thread_samples[i] = (struct data_sample *) malloc(numsamples * sizeof(struct data_sample));
+		thread_samples[i] = (struct data_sample *) calloc(numsamples + 1, sizeof(struct data_sample));
 		snprintf((char *) fname, FNAMESIZE, "core%d.msrdat", i);
 		output[i] = fopen(fname, "w");
 	}
 
 	int function = FUNC_SKL_COREI_FMA_1T;
 	struct mydata *dp = (struct mydata *) calloc(THREADCOUNT, sizeof(struct mydata));
-	init_threads(dp, function, THREADCOUNT);
+	if (init_threads(dp, function, THREADCOUNT) != FS_OK)
+	{
+		fprintf(stderr, "ERROR: initialization\n");
+		return -1;
+	}
+	fprintf(stdout, "Initialization complete...\n");
 	set_workload(asm_work_skl_corei_fma_1t);
 	set_sampling(sample_data);
 	set_idle(fence_workload);
 
 	struct timeval start, current;
+	fprintf(stdout, "Benchmark begin...\n");
 	gettimeofday(&start, NULL);
 	gettimeofday(&current, NULL);
-	send_signal(SIGUSR1);
-	while ((current.tv_sec - start.tv_sec) < duration)
+	send_signal(SIGPOLL);
+	while (((float) (current.tv_sec - start.tv_sec) + (current.tv_usec - start.tv_usec) / 1000000.0) < duration)
 	{
-		send_signal(SIGPOLL);
-		usleep(srate - 2);
-		send_signal(SIGUSR2);
-		usleep(2);
-		send_signal(SIGPOLL);
-		usleep(srate - 2);
 		send_signal(SIGUSR1);
-		usleep(2);
+		usleep(workduty - 1);
+		send_signal(SIGUSR2);
+		usleep(sleepduty - 1);
+		send_signal(SIGPOLL);
+		// give the polling time to do its thing
+		usleep(1);
 
 		gettimeofday(&current, NULL);
 	}
 	send_signal(SIGTERM);
+	fprintf(stdout, "Benchmark complete...\n");
+	fprintf(stdout, "Actual run time: %f\n", (float) (current.tv_sec - start.tv_sec) + (current.tv_usec - start.tv_usec) / 1000000.0);
+	fprintf(stdout, "Dumping data file(s)...\n");
 
-	dump_data(output, SAMPLECTR);
+	dump_data(output, numsamples);
 	for (i = 0; i < THREADCOUNT; i++)
 	{
+		fprintf(stdout, "Thread %d collected %lu samples\n", i, SAMPLECTRS[i]);
 		free(thread_samples[i]);
 	}
 	free(thread_samples);
 	free(output);
+	free(SAMPLECTRS);
+	free(dp);
 
 	finalize_msr();
+
+	fprintf(stdout, "Done...\n");
 
 	return 0;
 };

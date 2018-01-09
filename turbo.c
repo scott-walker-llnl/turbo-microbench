@@ -17,8 +17,9 @@
 #define LOAD_HIGH 1
 #define INIT_BLOCKSIZE 8192
 #define EXIT_SUCCESS 0
-#define FREQ_HIGH (0x2B)
+#define FREQ_HIGH (0x2D)
 #define LOW_FREQ (0x2A)
+#define MEMBUFFSIZE (0x1 << 23) // 1 MB
 
 // used by firestarter
 typedef struct threaddata_t
@@ -48,14 +49,18 @@ struct thread_data
 	unsigned num_threads;
 	pthread_t *threads;
 	char arch;
+	char *buf1;
+	char *buf2;
 };
 
 unsigned int TLIM;
+char WORKLOAD; // 0 = fs, 1 = memory
 
 // workloads
 void nop_workload(const unsigned iter);
 void alu_workload(const unsigned iter);
 void fence_workload(const unsigned iter);
+void memory_workload(struct thread_data *tdat);
 
 // prototypes
 void work(void *data);
@@ -171,6 +176,8 @@ int main(int argc, char **argv)
 	for (itr = 0; itr < num_threads; itr++)
 	{
 		tdat[itr].arch = argv[5][0];
+		tdat[itr].buf1 = (char *) malloc(MEMBUFFSIZE * sizeof(char));
+		tdat[itr].buf2 = (char *) malloc(MEMBUFFSIZE * sizeof(char));
 		threaddata[itr].alignment = ALIGNMENT;
 		threaddata[itr].buffersizeMem = BUFFERSIZEMEM;
 		threaddata[itr].bufferMem = _mm_malloc(threaddata[itr].buffersizeMem, threaddata[itr].alignment);
@@ -436,7 +443,8 @@ void work(void *data)
 	//barrier(tdat->tid, tdat->threaddata);
 	
 	int phase_end = 0;
-	int phase_start = 0;
+	int phase_start = -1;
+	int has_signaled = 0;
 	int i;
 	for (i = 0; i < tdat->niter; i++)
 	{
@@ -444,6 +452,7 @@ void work(void *data)
 		if (i == tdat->num_alu && tdat->tid == 0)
 		{
 			TLIM = LOW_FREQ;
+			WORKLOAD = 1;
 			//set_turbo_limit(TLIM);
 			send_sigusr(tdat->num_threads, tdat->threads);
 		}
@@ -451,33 +460,44 @@ void work(void *data)
 		{
 			TLIM = FREQ_HIGH;
 			//set_turbo_limit(TLIM);
+			WORKLOAD = 0;
 			send_sigusr(tdat->num_threads, tdat->threads);
+			has_signaled =  1;
 			phase_end = 1;
 		}
-		if (tdat->arch == 'l')
+		if (WORKLOAD == 0)
 		{
-			asm_work_skl_corei_fma_1t(tdat->threaddata);
-		}
-		else if (tdat->arch == 's')
-		{
-			asm_work_snb_xeonep_avx_1t(tdat->threaddata);
+			if (tdat->arch == 'l')
+			{
+				asm_work_skl_corei_fma_1t(tdat->threaddata);
+			}
+			else if (tdat->arch == 's')
+			{
+				asm_work_snb_xeonep_avx_1t(tdat->threaddata);
+			}
+			else
+			{
+				fprintf(stderr, "bad arch\n");
+			}
 		}
 		else
 		{
-			fprintf(stderr, "bad arch\n");
+			memory_workload(tdat);
 		}
 		int ret = perf_sample(tdat);
 		if (phase_end == 1 && tdat->tid == 0 && ret == 1)
 		{
 			TLIM = LOW_FREQ;
+			WORKLOAD = 1;
 			send_sigusr(tdat->num_threads, tdat->threads);
 			phase_start = i;
 			phase_end = 0;
 		}
-		if (tdat->tid == 0 && 
+		if (tdat->tid == 0 && has_signaled &&
 			i == phase_start + (tdat->num_nop - tdat->num_alu))
 		{
 			TLIM = FREQ_HIGH;
+			WORKLOAD = 0;
 			send_sigusr(tdat->num_threads, tdat->threads);
 			phase_end = 1;
 		}
@@ -503,6 +523,19 @@ void work(void *data)
 		}
 	}
 
+}
+
+void memory_workload(struct thread_data *tdat)
+{
+	static int j = 0;
+	int i = 0;
+	j += 32;
+	for (i = 0; i < (2 << 14); i++)
+	{
+		tdat->buf1[j] = j + i;
+		tdat->buf2[j] += tdat->buf1[j] + i;
+		j = (j + 1024) % MEMBUFFSIZE;
+	}
 }
 
 void fence_workload(const unsigned iter)
