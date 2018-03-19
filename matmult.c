@@ -12,6 +12,7 @@
 #define POWER_TDP_DEFAULT 100.0
 #define MANUAL_TURBO_DEFAULT 1
 
+typedef float v8f __attribute__((vector_size(32)));
 typedef float v4f __attribute__((vector_size(16)));
 
 struct thread_data
@@ -120,25 +121,80 @@ void swap_matrix(float **matrix1, float **matrix2, thread_data *tdat)
 	}
 }
 
-void matmult(thread_data *tdat)
+void matmult8(thread_data *tdat)
 {
-	v4f a, b, *c;
+	v8f a, b, d, e, f, g, h, x, y, z;
+	v8f *c;
 	int i, j, k;
-	for (i = tdat->tid * tdat->subsize; i < (tdat->tid * tdat->subsize) + tdat->subsize; i++)
+	for (i = tdat->tid * tdat->subsize; i < (tdat->tid * tdat->subsize) + tdat->subsize; i += 8)
+	{
+		for (j = 0; j < tdat->matsize; j += 8)
+		{
+			for (k = 0; k < tdat->matsize; k += 8)
+			{
+				__asm__ __volatile__(
+					"#begin vec\n\t"
+				);
+				//tdat->matrix_out[i][j] += tdat->matrix_a[i][k] * tdat->matrix_b[k][j];
+				a = *((v8f *) &tdat->matrix_a[i][k]);
+				b = *((v8f *) &tdat->matrix_b[k][j]);
+				/*
+				d = a + b;
+				e = b - a;
+				f = a * e;
+				g = b + f;
+				h = a + d * f + g * e;
+				x = a + b + d + e + f + g + h;
+				y = a * b * d * e * f * g * g;
+				z = x + y;
+				*/
+				c = (v8f *) &tdat->matrix_out[i][j];
+				*c += a * b;// + h + (x * y * z);
+				__asm__ __volatile__(
+					"#end vec\n\t"
+				);
+			}
+		}
+	}
+}
+
+void matmult4(thread_data *tdat)
+{
+	v4f a, b, d, e, f, g, h, x, y, z;
+	v4f *c;
+	int i, j, k;
+	for (i = tdat->tid * tdat->subsize; i < (tdat->tid * tdat->subsize) + tdat->subsize; i += 4)
 	{
 		for (j = 0; j < tdat->matsize; j += 4)
 		{
 			for (k = 0; k < tdat->matsize; k += 4)
 			{
+				__asm__ __volatile__(
+					"#begin vec\n\t"
+				);
 				//tdat->matrix_out[i][j] += tdat->matrix_a[i][k] * tdat->matrix_b[k][j];
 				a = *((v4f *) &tdat->matrix_a[i][k]);
 				b = *((v4f *) &tdat->matrix_b[k][j]);
+				/*
+				d = a + b;
+				e = b - a;
+				f = a * e;
+				g = b + f;
+				h = a + d * f + g * e;
+				x = a + b + d + e + f + g + h;
+				y = a * b * d * e * f * g * g;
+				z = x + y;
+				*/
 				c = (v4f *) &tdat->matrix_out[i][j];
-				*c += a * b;
+				*c += a * b;// + h + (x * y * z);
+				__asm__ __volatile__(
+					"#end vec\n\t"
+				);
 			}
 		}
 	}
 }
+
 
 void *thread_work(void *arg)
 {
@@ -147,22 +203,21 @@ void *thread_work(void *arg)
 	double elapsed;
 	int itr = 0;
 
-	set_perf(FREQ_HIGH, tdat->numthreads);
+	//set_perf(FREQ_HIGH, tdat->numthreads);
 	do
 	{
-		matmult(tdat);
+		matmult4(tdat);
 		gettimeofday(&current, NULL);
 		elapsed = (current.tv_sec - tdat->begin.tv_sec) + (current.tv_usec - tdat->begin.tv_usec) / 1000000;
-		/*
 		if (MANUAL_TURBO)
 		{
 			set_perf(FREQ_LOW, tdat->numthreads);
 		}
-		swap_matrix(tdat->matrix_n, tdat->matrix_m, tdat);
-		swap_matrix(tdat->matrix_n, tdat->matrix_m, tdat);
-		swap_matrix(tdat->matrix_n, tdat->matrix_m, tdat);
-		swap_matrix(tdat->matrix_n, tdat->matrix_m, tdat);
-		swap_matrix(tdat->matrix_n, tdat->matrix_m, tdat);
+		//swap_matrix(tdat->matrix_n, tdat->matrix_m, tdat);
+		//swap_matrix(tdat->matrix_n, tdat->matrix_m, tdat);
+		//swap_matrix(tdat->matrix_n, tdat->matrix_m, tdat);
+		//swap_matrix(tdat->matrix_n, tdat->matrix_m, tdat);
+		//swap_matrix(tdat->matrix_n, tdat->matrix_m, tdat);
 		//swap_matrix(tdat->matrix_n, tdat->matrix_m, tdat);
 		//swap_matrix(tdat->matrix_n, tdat->matrix_m, tdat);
 		//swap_matrix(tdat->matrix_n, tdat->matrix_m, tdat);
@@ -172,7 +227,6 @@ void *thread_work(void *arg)
 		{
 			set_perf(FREQ_HIGH, tdat->numthreads);
 		}
-		*/
 		itr++;
 	} while (elapsed < tdat->duration);
 	tdat->itrcount = itr;
@@ -209,13 +263,14 @@ int main(int argc, char ** argv)
 		FREQ_HIGH, FREQ_LOW, POWER_LIMIT, POWER_TDP, MANUAL_TURBO);
 
 
+	uint64_t default_turbo = get_turbo_limit();
 	enable_turbo(0);
-	set_perf(FREQ_LOW, numthreads);
-	set_turbo_limit(FREQ_HIGH);
+	//set_perf(FREQ_LOW, numthreads);
+	//set_turbo_limit(FREQ_HIGH);
 	double sec_unit, pow_unit;
 	get_rapl_units(&pow_unit, &sec_unit);
-	set_rapl2(32, POWER_LIMIT, pow_unit, sec_unit, 0);
-	set_rapl(1, POWER_TDP, pow_unit, sec_unit, 0);
+	//set_rapl2(32, POWER_LIMIT, pow_unit, sec_unit, 0);
+	//set_rapl(1, POWER_TDP, pow_unit, sec_unit, 0);
 
 	struct timeval before, after;
 	gettimeofday(&before, NULL);
@@ -276,6 +331,8 @@ int main(int argc, char ** argv)
 		totalitr += tdat[itr].itrcount;
 	}
 	fprintf(irp, "Total iterations %lu\n", totalitr);
+
+	set_all_turbo_limit(default_turbo);
 
 	free(threads);
 	free_matrix(matrix_a, matsize);

@@ -1,6 +1,6 @@
-INCLUDES_PATH=/home/walker8/libmsr/install/include
+INCLUDES_PATH=/home/walker8/lib/include
 LIBFS_INCLUDES=/home/walker8/libfs
-LIBS_PATH=/home/walker8/libmsr/install/lib
+LIBS_PATH=/home/walker8/lib/lib
 LIBFS_PATH=/home/walker8/libfs
 
 turbo: turbo.c
@@ -16,8 +16,19 @@ cfb: cfb.c
 sampler: sampler.c
 	gcc sampler.c -O3 -lm -L${LIBS_PATH} -lmsr -I${INCLUDES_PATH} -o sampler -std=c99
 
+msr: msr.c
+	gcc -c msr.c -O3 -I${INCLUDES_PATH} -o msr.o
+
+matmult: matmult.c msr
+	gcc matmult.c msr.o -O3 -mtune=native -pthread -L${LIBS_PATH} -lmsr -lm -I${INCLUDES_PATH} -o mm -std=c99
+
+mmass:
+	gcc matmult.c msr.o -O3 -mtune=native -S -pthread -I${INCLUDES_PATH} -std=c99
+
 clean:
 	rm -rf turbo
 	rm -rf repro
 	rm -rf cfb
 	rm -rf sampler
+	rm -rf msr.o
+	rm -rf mm
