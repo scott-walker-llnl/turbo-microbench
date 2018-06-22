@@ -297,6 +297,7 @@ int single_program(pid_t phase1child, pid_t samchild, unsigned long timelim)
 		result = waitpid(phase1child, &status, WNOHANG);
 		result3 = waitpid(samchild, &status, WNOHANG);
 		resmask = result | result3;
+		//set_perf(0x8, 4);
 	}
 
 	if (timelim * 1000000 <= totalus)
@@ -337,7 +338,7 @@ int main(int argc, char **argv)
 {
 	if (argc != 6)
 	{
-		fprintf(stderr, GREEN "[CONTROLLER] useage: ./fx <freq phase 1> <freq phase 2> <cycle len in ms> <time limit (phase 1)> <phase ratio (0-1)>" RESET "\n");
+		fprintf(stderr, GREEN "[CONTROLLER] useage: ./fx <freq phase 1> <freq phase 2> <cycle len in us> <time limit (phase 1)> <phase ratio (0-1)>" RESET "\n");
 		return -1;
 	}
 
@@ -349,7 +350,7 @@ int main(int argc, char **argv)
 	printf(GREEN "[CONTROLLER] Phase 1 Frequency: %x" RESET "\n", freq_ph_1);
 	printf(GREEN "[CONTROLLER] Phase 2 Frequency: %x" RESET "\n", freq_ph_2);
 	printf(GREEN "[CONTROLLER] Phase Ratio: %f" RESET "\n", ratio);
-	printf(GREEN "[CONTROLLER] Cycle Length (ms): %d" RESET "\n", cycle);
+	printf(GREEN "[CONTROLLER] Cycle Length (us): %d" RESET "\n", cycle);
 	//printf(GREEN "[CONTROLLER] Power Limit: %s" RESET "\n", argv[4]);
 	printf(GREEN "[CONTROLLER] Time Limit (phase 1): %u" RESET "\n", timelim);
 	
@@ -494,6 +495,7 @@ int main(int argc, char **argv)
 	// let the benchmarks get through their initialization phase
 	// set the frequency high, in case it was left low
 	//set_perf(INIT_FREQ, 4);
+	//set_perf(0x8, 4);
 	sleep(INIT_TIME);
 	
 	if (cycle > 0)

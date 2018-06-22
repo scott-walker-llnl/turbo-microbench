@@ -23,14 +23,24 @@
 #define RPC_THRESH 0.9 // threshold for identifying new phases based on resource stalls per cycle
 #define EPC_THRESH 0.9 // threshold for identifying new phases based on execution stalls per cycle
 #define BPC_THRESH 0.9 // threshold for identifying new phases based on branch instructions per cycle
-#define LIMIT_FLAGS 0x8000800
-#define LIMIT_LOG_MASK 0xF7FFFFFF
+#define LIMIT_ON_RAPL 0x0000C00
+#define LIMIT_LOG_RAPL 0xC000000
+#define LIMIT_LOG_MASK 0xF3FFFFFF
 #define MAX_NON_TURBO 4.2
 #define MAX_PROFILES 20
 //#define DIST_THRESH 0.25
 //#define PCT_THRESH 0.01
 #define PRUNE_THRESH 0.000001
 #define MAX_HISTORY 8
+#define NUM_CPU 4
+#define NUM_CLASSES 4
+#define FUP_TIMEOUT 3
+
+#define TDP_SORTA 93.0
+
+#define FDELTA 1
+
+//#define MAN_TEST
 
 struct data_sample
 {
@@ -59,16 +69,20 @@ struct phase_profile
 	double avg_frq; // average frequency measured for this phase
 	uint16_t frq_high; // max frequency measured for this phase
 	uint16_t frq_low; // min frequency measured for this phase
-	uint64_t avg_cycle; // average number of cycles it takes to execute this phase
+	double avg_cycle; // average number of cycles it takes to execute this phase
 	uint32_t num_throttles; // number of times this phase was throttled last time (aka misprediction)
 	uint64_t occurrences; // how many times this phase was detected
 	char prev_phases[MAX_HISTORY];
 	char lastprev;
+	char class;
+	char unthrot_count;
 };
 
 struct phase_profile profiles[MAX_PROFILES];
 struct phase_profile prof_maximums;
 struct phase_profile prof_minimums;
+struct phase_profile prof_class[NUM_CLASSES];
+char CLASS_NAMES[NUM_CLASSES + 1][8] = {"CPU\0", "MEM\0", "IO\0", "MIX\0", "UNK\0"};
 int numphases = 0;
 int recentphase = -1;
 int lastglom = 0;
@@ -80,7 +94,9 @@ double PCT_THRESH = 0.01;
 double energy_unit;
 double seconds_unit;
 double avg_sample_rate;
+double powlim = 0.0;
 FILE *sreport;
+char MAN_CTRL = 0;
 
 int LOOP_CTRL = 1;
 
@@ -88,24 +104,30 @@ void set_perf(const unsigned freq);
 void dump_phaseinfo(FILE *outfile, double *avgrate);
 
 double metric_distance(struct phase_profile *old, struct phase_profile *new, struct phase_profile *maximums, 
-	struct phase_profile *minimums)
+	struct phase_profile *minimums, uint64_t new_perf, uint64_t old_perf)
 {
 	double ipcnorm = ((old->ipc - minimums->ipc) / (maximums->ipc - minimums->ipc)) -
 					 ((new->ipc - minimums->ipc) / (maximums->ipc - minimums->ipc));
+	//ipcnorm *= new_perf / old_perf;
 
-	double mpcnorm = ((old->mpc - minimums->mpc) / (maximums->mpc - minimums->mpc)) -
-					 ((new->mpc - minimums->mpc) / (maximums->mpc - minimums->mpc));
+	//double mpcnorm = ((old->mpc - minimums->mpc) / (maximums->mpc - minimums->mpc)) -
+	//				 ((new->mpc - minimums->mpc) / (maximums->mpc - minimums->mpc));
+	//mpcnorm *= new_perf / old_perf;
 
-	double rpcnorm = ((old->rpc - minimums->rpc) / (maximums->rpc - minimums->rpc)) -
-					 ((new->rpc - minimums->rpc) / (maximums->rpc - minimums->rpc));
+	//double rpcnorm = ((old->rpc - minimums->rpc) / (maximums->rpc - minimums->rpc)) -
+	//				 ((new->rpc - minimums->rpc) / (maximums->rpc - minimums->rpc));
+	//rpcnorm *= new_perf / old_perf;
 
 	double epcnorm = ((old->epc - minimums->epc) / (maximums->epc - minimums->epc)) -
 					 ((new->epc - minimums->epc) / (maximums->epc - minimums->epc));
+	//epcnorm *= new_perf / old_perf;
 
-	double bpcnorm = ((old->bpc - minimums->bpc) / (maximums->bpc - minimums->bpc)) -
-					 ((new->bpc - minimums->bpc) / (maximums->bpc - minimums->bpc));
+	//double bpcnorm = ((old->bpc - minimums->bpc) / (maximums->bpc - minimums->bpc)) -
+	//				 ((new->bpc - minimums->bpc) / (maximums->bpc - minimums->bpc));
+	//bpcnorm *= new_perf / old_perf;
 	
-	return sqrt(pow(ipcnorm, 2.0) + pow(mpcnorm, 2.0) + pow(rpcnorm, 2.0) + pow(epcnorm, 2.0) + pow(bpcnorm, 2.0));
+	//return sqrt(pow(ipcnorm, 2.0) + pow(mpcnorm, 2.0) + pow(rpcnorm, 2.0) + pow(epcnorm, 2.0) + pow(bpcnorm, 2.0));
+	return sqrt(pow(ipcnorm, 2.0) + pow(epcnorm, 2.0));
 }
 
 void agglomerate_profiles()
@@ -141,7 +163,9 @@ void agglomerate_profiles()
 		{
 			if (i != j && valid[j])
 			{
-				double dist = metric_distance(&old_profiles[i], &old_profiles[j], &prof_maximums, &prof_minimums);
+				double dist = metric_distance(&old_profiles[i], &old_profiles[j], &prof_maximums, 
+						&prof_minimums, (uint64_t) (old_profiles[i].avg_frq * 10.0),
+						(uint64_t) (old_profiles[j].avg_frq * 10.0));
 				if (dist < DIST_THRESH)
 				{
 					matches[j] = 1;
@@ -163,6 +187,7 @@ void agglomerate_profiles()
 			profiles[newidx].bpc *= (profiles[newidx].occurrences / (double) occurrence_sum);
 			profiles[newidx].num_throttles *= 
 					(profiles[newidx].occurrences / (double) occurrence_sum);
+			profiles[newidx].avg_cycle *= (profiles[newidx].occurrences / (double) occurrence_sum);
 			int numglom = 1;
 			for (j = 0; j < numphases; j++)
 			{
@@ -185,6 +210,8 @@ void agglomerate_profiles()
 							(old_profiles[j].occurrences / (double) occurrence_sum);
 					profiles[newidx].num_throttles += old_profiles[j].num_throttles * 
 							(old_profiles[j].occurrences / (double) occurrence_sum);
+					profiles[newidx].avg_cycle += old_profiles[j].avg_cycle * 
+							(old_profiles[j].occurrences / (double) occurrence_sum);
 
 					if (old_profiles[j].frq_high > profiles[newidx].frq_high)
 					{
@@ -198,7 +225,6 @@ void agglomerate_profiles()
 
 					// TODO
 					profiles[newidx].avg_frq += old_profiles[j].avg_frq;
-					profiles[newidx].avg_cycle = 0;
 					numglom++;
 				}
 			}
@@ -460,16 +486,6 @@ void update_profile(struct phase_profile *this_profile, int profidx, uint64_t pe
 		return;
 	}
 
-#ifdef DEBUG
-	if (profiles[profidx].ipc - this_profile->ipc > 0.5)
-	{
-		printf("that's wierd %d, this shouldn't happen but dist is %lf\n", profidx,
-			metric_distance(this_profile, &profiles[profidx], &prof_maximums, &prof_minimums));
-		print_profile(this_profile);
-		print_profile(&profiles[profidx]);
-	}
-#endif
-
 	profiles[profidx].ipc = (profiles[profidx].ipc * 
 			(profiles[profidx].occurrences / (profiles[profidx].occurrences + 1.0))) +
 			(this_profile->ipc * (1.0 / (profiles[profidx].occurrences + 1.0)));
@@ -490,14 +506,17 @@ void update_profile(struct phase_profile *this_profile, int profidx, uint64_t pe
 			(profiles[profidx].occurrences / (profiles[profidx].occurrences + 1.0))) +
 			(this_profile->bpc * (1.0 / (profiles[profidx].occurrences + 1.0)));
 
-	profiles[profidx].num_throttles = (profiles[profidx].num_throttles * 
-			(profiles[profidx].occurrences / (profiles[profidx].occurrences + 1.0))) +
-			(this_profile->num_throttles * (1.0 / (profiles[profidx].occurrences + 1.0)));
+//	profiles[profidx].num_throttles = (profiles[profidx].num_throttles * 
+//			(profiles[profidx].occurrences / (profiles[profidx].occurrences + 1.0))) +
+//			(this_profile->num_throttles * (1.0 / (profiles[profidx].occurrences + 1.0)));
+	profiles[profidx].num_throttles += this_throttle;
 
+/*
 	if (perf > profiles[profidx].frq_high)
 	{
 		profiles[profidx].frq_high = perf;
 	}
+*/
 	if (perf < profiles[profidx].frq_low)
 	{
 		profiles[profidx].frq_low = perf;
@@ -505,7 +524,6 @@ void update_profile(struct phase_profile *this_profile, int profidx, uint64_t pe
 
 	// TODO
 	profiles[profidx].avg_frq = avgfrq;
-	profiles[profidx].avg_cycle = 0;
 	profiles[profidx].occurrences++;
 
 	char last = profiles[profidx].lastprev;
@@ -536,7 +554,7 @@ void add_profile(struct phase_profile *this_profile, uint64_t perf, unsigned thi
 	profiles[numphases].bpc = this_profile->bpc;
 
 	profiles[numphases].avg_frq = avgfrq;
-	profiles[numphases].frq_high = perf & 0xFFFF;
+	profiles[numphases].frq_high = 0x2D;
 	profiles[numphases].frq_low = perf & 0xFFFF;
 	profiles[numphases].avg_cycle = 0;
 	profiles[numphases].num_throttles = this_throttle;
@@ -544,22 +562,134 @@ void add_profile(struct phase_profile *this_profile, uint64_t perf, unsigned thi
 	memset(profiles[numphases].prev_phases, -1, MAX_HISTORY);
 	profiles[numphases].prev_phases[0] = lastphase;
 	profiles[numphases].lastprev = 0;
+	profiles[numphases].class = 4;
+	profiles[numphases].unthrot_count = 0;
 
 	numphases++;
+}
+
+void classify_and_react(int phase, char isthrottled, char wasthrottled, uint64_t perf)
+{
+	int minidx = -1;
+	double mindist = DBL_MAX;
+	int i;
+	for (i = 0; i < NUM_CLASSES; i++)
+	{
+		double dist = metric_distance(&profiles[phase], &prof_class[i], &prof_maximums, &prof_minimums,
+				perf, 0x2Dul);
+		if (dist < mindist)
+		{
+			mindist = dist;
+			minidx = i;
+		}
+	}
+	switch (minidx)
+	{
+		case 0:
+			// is CPU phase
+			if (wasthrottled)
+			{
+				set_perf(profiles[phase].frq_high - 1);
+				if (perf < profiles[phase].frq_high)
+				{
+					profiles[phase].frq_high--;
+				}
+				profiles[phase].unthrot_count = 0;
+			}
+			else
+			{
+				if (perf > profiles[phase].frq_high)
+				{
+					profiles[phase].frq_high = perf;
+				}
+				if (profiles[phase].frq_high < 0x2D && 
+					profiles[phase].unthrot_count >= FUP_TIMEOUT)
+				{
+					profiles[phase].frq_high++;
+				}
+				/*
+				else
+				{
+					profiles[phase].frq_high++;
+				}
+				*/
+				/*
+				else if ((double) perf < profiles[phase].avg_frq)
+				{
+					profiles[phase].frq_high++;
+				}
+				*/
+				profiles[phase].unthrot_count++;
+				set_perf(profiles[phase].frq_high);
+			}
+			profiles[phase].class = 0;
+			break;
+		case 1:
+			// is MEM phase
+			/*
+			if (wasthrottled)
+			{
+				set_perf((unsigned) (profiles[phase].avg_frq * 10) - FDELTA);
+				profiles[phase].unthrot_count = 0;
+			}
+			else
+			{
+				set_perf((unsigned long) (4.5 * (powlim / TDP_SORTA) * 10));
+			}
+			*/
+			//set_perf((unsigned long) (4.5 * (powlim / TDP_SORTA) * 10.0));
+			set_perf(0x2A);
+			profiles[phase].class = 1;
+			break;
+		case 2:
+			// is IO phase
+			set_perf(0x2A); // seems counterintiutive but, yes, this should be high
+			profiles[phase].class = 2;
+			break;
+		case 3:
+			// is MIXED phase
+			if (wasthrottled)
+			{
+				set_perf((unsigned) (profiles[phase].avg_frq * 10) - FDELTA);
+				profiles[phase].unthrot_count = 0;
+			}
+			else
+			{
+				if (profiles[phase].unthrot_count > FUP_TIMEOUT)
+				{
+					set_perf((unsigned) (profiles[phase].avg_frq * 10) + FDELTA * 2);
+				}
+				else
+				{
+					set_perf((unsigned) (profiles[phase].avg_frq * 10) + FDELTA);
+				}
+			}
+			profiles[phase].class = 3;
+			break;
+		default:
+			printf("ERROR: no phase classification\n");
+			profiles[phase].class = 4;
+			break;
+	}
 }
 
 void pow_aware_perf()
 {
 	static uint64_t last_instret = 1;
 	static double last_ipc = 0, last_mpc = 0, last_rpc = 0, last_epc = 0, last_bpc = 0;
+	static uint64_t begin_aperf = 0, begin_mperf = 0;
 	static uint64_t last_aperf = 0, last_mperf = 0;
 	static uint64_t tsc_timer = 0;
+	static uint64_t phase_start_tsc = 0;
 
 	if (last_aperf == 0)
 	{
-		read_msr_by_coord(0, 0, 0, MSR_IA32_MPERF, &last_mperf);
-		read_msr_by_coord(0, 0, 0, MSR_IA32_APERF, &last_aperf);
+		read_msr_by_coord(0, 0, 0, MSR_IA32_MPERF, &begin_mperf);
+		read_msr_by_coord(0, 0, 0, MSR_IA32_APERF, &begin_aperf);
 		read_msr_by_coord(0, 0, 0, IA32_TIME_STAMP_COUNTER, &tsc_timer);
+		phase_start_tsc = tsc_timer;
+		last_aperf = begin_aperf;
+		last_mperf = begin_mperf;
 	}
 
 	uint64_t aperf, mperf;
@@ -575,7 +705,8 @@ void pow_aware_perf()
 	uint64_t this_exstalls = thread_samples[0][SAMPLECTRS[0]].exstalls - thread_samples[0][SAMPLECTRS[0] - 1].exstalls;
 	uint64_t this_branchret = thread_samples[0][SAMPLECTRS[0]].branchret - thread_samples[0][SAMPLECTRS[0] - 1].branchret;
 
-	double avgfrq = ((double) (aperf - last_aperf) / (double) (mperf - last_mperf)) * MAX_NON_TURBO;
+	double total_avgfrq = ((double) (aperf - begin_aperf) / (double) (mperf - begin_mperf)) * MAX_NON_TURBO;
+	double phase_avgfrq = ((double) (aperf - last_aperf) / (double) (mperf - last_mperf)) * MAX_NON_TURBO;
 	uint64_t perf = ((thread_samples[0][SAMPLECTRS[0]].frq_data & 0xFFFFul) >> 8);
 
 	struct phase_profile this_profile;
@@ -605,7 +736,7 @@ void pow_aware_perf()
 
 	if (numphases == 0)
 	{
-		add_profile(&this_profile, perf, this_throttle, avgfrq, recentphase);
+		add_profile(&this_profile, perf, 0, phase_avgfrq, recentphase);
 		return;
 	}
 	// we do phase analysis
@@ -613,8 +744,21 @@ void pow_aware_perf()
 	// check to see if we are in the same phase
 	if (recentphase > numphases)
 	{
-		printf("recent phase no longer exists\n");
+		//printf("recent phase no longer exists\n");
 		recentphase = -1;
+	}
+
+	uint64_t limreasons = thread_samples[0][SAMPLECTRS[0]].perflimit;
+	char isthrottled = 0;
+	char wasthrottled = 0;
+	if (limreasons & LIMIT_LOG_RAPL)
+	{
+		write_msr_by_coord(0, 0, 0, MSR_CORE_PERF_LIMIT_REASONS, (limreasons & LIMIT_LOG_MASK));
+		wasthrottled = 1;
+	}
+	if (limreasons & LIMIT_ON_RAPL)
+	{
+		isthrottled = 1;
 	}
 
 	double distances[MAX_PROFILES];
@@ -625,14 +769,30 @@ void pow_aware_perf()
 	}
 	if (recentphase >= 0)
 	{
-		distances[recentphase] = metric_distance(&profiles[recentphase], &this_profile, &prof_maximums, &prof_minimums);
+		distances[recentphase] = metric_distance(&profiles[recentphase], &this_profile, &prof_maximums, 
+				&prof_minimums, (uint64_t) (profiles[recentphase].avg_frq * 10.0), perf);
 		if (distances[recentphase] < DIST_THRESH)
 		{
 			// we are in the same phase
 			// update existing phase
 			//printf("update recent\n");
-			update_profile(&this_profile, recentphase, perf, this_throttle, avgfrq, recentphase);
+			update_profile(&this_profile, recentphase, perf, wasthrottled, phase_avgfrq, recentphase);
+			if (MAN_CTRL)
+			{
+				classify_and_react(recentphase, isthrottled, wasthrottled, perf);
+			}
 			return;
+		}
+		else
+		{
+			// the phase changed
+			if (profiles[recentphase].avg_cycle < (thread_samples[0][SAMPLECTRS[0]].tsc_data - phase_start_tsc))
+			{
+				profiles[recentphase].avg_cycle = (thread_samples[0][SAMPLECTRS[0]].tsc_data - phase_start_tsc);
+			}
+			phase_start_tsc = thread_samples[0][SAMPLECTRS[0]].tsc_data;
+			last_aperf = aperf;
+			last_mperf = mperf;
 		}
 	}
 	// we are in a new phase so search for the best match
@@ -642,7 +802,8 @@ void pow_aware_perf()
 	int i;
 	for (i = 0; i < numphases; i++)
 	{
-		distances[i] = metric_distance(&profiles[i], &this_profile, &prof_maximums, &prof_minimums);
+		distances[i] = metric_distance(&profiles[i], &this_profile, &prof_maximums, &prof_minimums, 
+				(uint64_t) (profiles[i].avg_frq * 10.0), perf);
 		if (distances[i] < min_dist)
 		{
 			min_dist = distances[i];
@@ -657,8 +818,12 @@ void pow_aware_perf()
 	{
 		// update existing phase
 		//printf("update existing %d distance %lf\n", min_idx, min_dist);
-		update_profile(&this_profile, min_idx, perf, this_throttle, avgfrq, recentphase);
+		update_profile(&this_profile, min_idx, perf, isthrottled, phase_avgfrq, recentphase);
 		recentphase = min_idx;
+		if (MAN_CTRL)
+		{
+			classify_and_react(recentphase, isthrottled, wasthrottled, perf);
+		}
 	}
 	else
 	{
@@ -668,7 +833,7 @@ void pow_aware_perf()
 		}
 		// add new phase
 		//printf("add new %d\n", numphases + 1);
-		add_profile(&this_profile, perf, this_throttle, avgfrq, recentphase);
+		add_profile(&this_profile, perf, isthrottled, phase_avgfrq, recentphase);
 #ifdef DEBUG
 		for (q = 0; q < numphases; q++)
 		{
@@ -701,7 +866,7 @@ void set_perf(const unsigned freq)
 	//write_msr_by_coord(0, tid, 0, IA32_PERF_CTL, perf_ctl);
 	//write_msr_by_coord(0, tid, 1, IA32_PERF_CTL, perf_ctl);
 	int i;
-	for (i = 0; i < THREADCOUNT; i++)
+	for (i = 0; i < NUM_CPU; i++)
 	{
 		write_msr_by_coord(0, i, 0, IA32_PERF_CTL, perf_ctl);
 		write_msr_by_coord(0, i, 1, IA32_PERF_CTL, perf_ctl);
@@ -726,13 +891,24 @@ void dump_phaseinfo(FILE *outfile, double *avgrate)
 			fprintf(outfile, "PHASE ID %d\t %.3lf seconds\t(%3.2lf%%)\n", i, *avgrate * 
 					profiles[i].occurrences, pct * 100.0);
 			totaltime += *avgrate * profiles[i].occurrences;
-			totalpct += pct * 100.0;
+			//totalpct += pct * 100.0;
 		}
 	}
 	if (avgrate != NULL)
 	{
-		fprintf(outfile, "TOTAL\t\t%lf\t%lf\n", totaltime, totalpct);
+		totalpct = (double) recorded_steps / (double) SAMPLECTRS[0];
+		fprintf(outfile, "TOTAL\t\t%.2lf\t(%3.2lf%% accounted)\n", totaltime, totalpct * 100.0);
 	}
+	fprintf(outfile, "min instructions per cycle        %lf\n", prof_minimums.ipc);
+	fprintf(outfile, "min LLC misses per cycle          %lf\n", prof_minimums.mpc);
+	fprintf(outfile, "min resource stalls per cycle     %lf\n", prof_minimums.rpc);
+	fprintf(outfile, "min execution stalls per cycle    %lf\n", prof_minimums.epc);
+	fprintf(outfile, "min branch instructions per cycle %lf\n", prof_minimums.bpc);
+	fprintf(outfile, "max instructions per cycle        %lf\n", prof_maximums.ipc);
+	fprintf(outfile, "max LLC misses per cycle          %lf\n", prof_maximums.mpc);
+	fprintf(outfile, "max resource stalls per cycle     %lf\n", prof_maximums.rpc);
+	fprintf(outfile, "max execution stalls per cycle    %lf\n", prof_maximums.epc);
+	fprintf(outfile, "max branch instructions per cycle %lf\n", prof_maximums.bpc);
 	for (i = 0; i < numphases; i++)
 	{
 		// ignore phases that are less than x% of program
@@ -743,7 +919,7 @@ void dump_phaseinfo(FILE *outfile, double *avgrate)
 		}
 		if (avgrate != NULL)
 		{
-			fprintf(outfile, "PHASE ID %d\t %.3lf seconds\t(%3.2lf%%)\n", i, *avgrate * 
+			fprintf(outfile, "\nPHASE ID %d\t %.3lf seconds\t(%3.2lf%%)\n", i, *avgrate * 
 					profiles[i].occurrences, pct * 100.0);
 		}
 		else
@@ -767,8 +943,10 @@ void dump_phaseinfo(FILE *outfile, double *avgrate)
 		fprintf(outfile, "\n\tavg frq     %lf\n", profiles[i].avg_frq);
 		fprintf(outfile, "\tfrq low       %x\n", profiles[i].frq_low);
 		fprintf(outfile, "\tfrq high      %x\n", profiles[i].frq_high);
-		fprintf(outfile, "\tavg cycles    %lu\n", profiles[i].avg_cycle);
+		fprintf(outfile, "\tavg cycles    %lf (%lf seconds)\n", profiles[i].avg_cycle, 
+				profiles[i].avg_cycle / (profiles[i].avg_frq * 1000000000.0));
 		fprintf(outfile, "\tnum throttles %u\n", profiles[i].num_throttles);
+		fprintf(outfile, "\tclass %s\n", CLASS_NAMES[profiles[i].class]);
 
 		int j;
 		for (j = 0; j < numphases; j++)
@@ -776,7 +954,8 @@ void dump_phaseinfo(FILE *outfile, double *avgrate)
 			double lpct = (double) profiles[j].occurrences / (double) recorded_steps;
 			if (lpct > PCT_THRESH)
 			{
-				double dist = metric_distance(&profiles[j], &profiles[i], &prof_maximums, &prof_minimums);
+				double dist = metric_distance(&profiles[j], &profiles[i], &prof_maximums, &prof_minimums, 
+						(uint64_t) (profiles[j].avg_frq * 10.0), (uint64_t) (profiles[i].avg_frq * 10.0));
 				fprintf(outfile, "\tdistance from %d: %lf\n", j, dist);
 			}
 		}
@@ -942,7 +1121,7 @@ void signal_exit(int signum)
 
 int main(int argc, char **argv)
 {
-	if (argc < 8)
+	if (argc < 9)
 	{
 		fprintf(stderr, "ERROR: bad arguments\n");
 		//fprintf(stderr, "Usage: ./t <threads> <duration in seconds> <samples per second> <rapl1> <rapl2>\n");
@@ -989,6 +1168,45 @@ int main(int argc, char **argv)
 	double rapl2 = (double) atof(argv[5]);
 	DIST_THRESH = (double) atof(argv[6]);
 	PCT_THRESH = (double) atof(argv[7]);
+	powlim = rapl1;
+	if (argv[8][0] == 'c')
+	{
+		MAN_CTRL = 1;
+	}
+	if (MAN_CTRL == 1)
+	{
+		printf("manual control ON\n");
+	}
+	else
+	{
+		printf("manual control OFF\n");
+	}
+	powlim = rapl2;
+	printf("rapl limit 1 %lf, rapl limit 2 %lf\n", rapl1, rapl2);
+
+	prof_class[0].ipc = 2.75;
+    prof_class[0].mpc = 0.02;
+    prof_class[0].rpc = 0.20;
+    prof_class[0].epc = 0.50;
+ 	prof_class[0].bpc = 0.01;
+
+	prof_class[1].ipc = 0.5;
+    prof_class[1].mpc = 0.01;
+    prof_class[1].rpc = 0.8;
+    prof_class[1].epc = 3.1;
+ 	prof_class[1].bpc = 0.05;
+
+	prof_class[2].ipc = 0;
+    prof_class[2].mpc = 0;
+    prof_class[2].rpc = 0;
+    prof_class[2].epc = 0;
+ 	prof_class[2].bpc = 0;
+
+	prof_class[3].ipc = 1.2;
+    prof_class[3].mpc = 0.01;
+    prof_class[3].rpc = 0.20;
+    prof_class[3].epc = 1.50;
+ 	prof_class[3].bpc = 0.01;
 
 	cpu_set_t cpus;
 	CPU_ZERO(&cpus);
@@ -1001,6 +1219,12 @@ int main(int argc, char **argv)
 	fprintf(sreport, "\tThreads: %u\n", THREADCOUNT);
 	fprintf(sreport, "\tTime: %u\n", duration);
 	fprintf(sreport, "\tSamples Per Second: %u\n", sps);
+
+	prof_minimums.ipc = DBL_MAX;
+	prof_minimums.mpc = DBL_MAX;
+	prof_minimums.rpc = DBL_MAX;
+	prof_minimums.epc = DBL_MAX;
+	prof_minimums.bpc = DBL_MAX;
 
 	uint64_t ovf_ctrl;
 	int ctr;
@@ -1081,6 +1305,7 @@ int main(int argc, char **argv)
 		snprintf((char *) fname, FNAMESIZE, "core%d.msrdat", i);
 		output[i] = fopen(fname, "w");
 	}
+	set_perf(0x2D);
 
 	fprintf(stdout, "Initialization complete...\n");
 	//sleep(0.25);
@@ -1161,20 +1386,20 @@ int main(int argc, char **argv)
 		fprintf(sreport, "Thread %d collected %lu samples\n", i, SAMPLECTRS[i]);
 		free(thread_samples[i]);
 	}
-	free(thread_samples);
-	free(output);
-	free(SAMPLECTRS);
 
 	snprintf((char *) fname, FNAMESIZE, "profiles", i);
 	FILE *profout = fopen(fname, "w");
 	//dump_phaseinfo(stdout, NULL);
-	agglomerate_profiles();
+	//agglomerate_profiles();
 	// TODO: figure out if miscounts from remove_unused or something else
 	remove_unused();
 	printf("phase results\n");
-	dump_phaseinfo(stdout, &avgrate);
+	dump_phaseinfo(profout, &avgrate);
 
 	//set_rapl(1, 105.0, pu, su, 0);
+	free(thread_samples);
+	free(output);
+	free(SAMPLECTRS);
 
 	finalize_msr();
 
