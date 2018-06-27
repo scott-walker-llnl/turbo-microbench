@@ -18,7 +18,6 @@
 
 #define MAX_BENCH_NAME 64
 #define INIT_TIME 0
-#define INIT_FREQ 0x2D
 
 extern char **environ;
 
@@ -297,7 +296,6 @@ int single_program(pid_t phase1child, pid_t samchild, unsigned long timelim)
 		result = waitpid(phase1child, &status, WNOHANG);
 		result3 = waitpid(samchild, &status, WNOHANG);
 		resmask = result | result3;
-		//set_perf(0x8, 4);
 	}
 
 	if (timelim * 1000000 <= totalus)
@@ -494,8 +492,6 @@ int main(int argc, char **argv)
 
 	// let the benchmarks get through their initialization phase
 	// set the frequency high, in case it was left low
-	//set_perf(INIT_FREQ, 4);
-	//set_perf(0x8, 4);
 	sleep(INIT_TIME);
 	
 	if (cycle > 0)

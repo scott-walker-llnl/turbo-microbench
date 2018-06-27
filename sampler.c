@@ -26,13 +26,11 @@
 #define LIMIT_ON_RAPL 0x0000C00
 #define LIMIT_LOG_RAPL 0xC000000
 #define LIMIT_LOG_MASK 0xF3FFFFFF
-#define MAX_NON_TURBO 4.2
 #define MAX_PROFILES 20
 //#define DIST_THRESH 0.25
 //#define PCT_THRESH 0.01
 #define PRUNE_THRESH 0.000001
 #define MAX_HISTORY 8
-#define NUM_CPU 4
 #define NUM_CLASSES 4
 #define FUP_TIMEOUT 3
 
@@ -97,6 +95,9 @@ double avg_sample_rate;
 double powlim = 0.0;
 FILE *sreport;
 char MAN_CTRL = 0;
+double MAX_NON_TURBO = 0.0;
+unsigned long MAX_PSTATE = 0x10ul;
+int NUM_CPU = -1;
 
 int LOOP_CTRL = 1;
 
@@ -554,7 +555,7 @@ void add_profile(struct phase_profile *this_profile, uint64_t perf, unsigned thi
 	profiles[numphases].bpc = this_profile->bpc;
 
 	profiles[numphases].avg_frq = avgfrq;
-	profiles[numphases].frq_high = 0x2D;
+	profiles[numphases].frq_high = MAX_PSTATE;
 	profiles[numphases].frq_low = perf & 0xFFFF;
 	profiles[numphases].avg_cycle = 0;
 	profiles[numphases].num_throttles = this_throttle;
@@ -576,7 +577,7 @@ void classify_and_react(int phase, char isthrottled, char wasthrottled, uint64_t
 	for (i = 0; i < NUM_CLASSES; i++)
 	{
 		double dist = metric_distance(&profiles[phase], &prof_class[i], &prof_maximums, &prof_minimums,
-				perf, 0x2Dul);
+				perf, MAX_PSTATEul);
 		if (dist < mindist)
 		{
 			mindist = dist;
@@ -602,7 +603,7 @@ void classify_and_react(int phase, char isthrottled, char wasthrottled, uint64_t
 				{
 					profiles[phase].frq_high = perf;
 				}
-				if (profiles[phase].frq_high < 0x2D && 
+				if (profiles[phase].frq_high < MAX_PSTATE && 
 					profiles[phase].unthrot_count >= FUP_TIMEOUT)
 				{
 					profiles[phase].frq_high++;
@@ -638,7 +639,7 @@ void classify_and_react(int phase, char isthrottled, char wasthrottled, uint64_t
 			}
 			*/
 			//set_perf((unsigned long) (4.5 * (powlim / TDP_SORTA) * 10.0));
-			set_perf(0x2A);
+			set_perf(0x1A);
 			profiles[phase].class = 1;
 			break;
 		case 2:
@@ -1095,15 +1096,6 @@ void hwpstuff()
 	hwp_log_req = 0x14150Alu;
 	//write_msr_by_coord(0, 0, 0, 0x772, hwp_req);
 	//write_msr_by_coord(0, 0, 0, 0x772, hwp_req);
-	int ctr;
-	for (ctr = 0; ctr < 4; ctr++)
-	{
-		//write_msr_by_coord(0, 1, 0, 0x774, hwp_log_req);
-		//write_msr_by_coord(0, 1, 1, 0x774, hwp_log_req);
-		//write_msr_by_coord(0, 1, 0, 0x774, hwp_log_req);
-		//write_msr_by_coord(0, 1, 1, 0x774, hwp_log_req);
-		//set_perf(0x2D, ctr);
-	}
 	read_msr_by_coord(0, 0, 0, 0x772, &hwp_req);
 	fprintf( sreport, "hwp req %lx\n", hwp_req);
 	read_msr_by_coord(0, 0, 0, 0x774, &hwp_log_req);
@@ -1121,7 +1113,7 @@ void signal_exit(int signum)
 
 int main(int argc, char **argv)
 {
-	if (argc < 9)
+	if (argc < 12)
 	{
 		fprintf(stderr, "ERROR: bad arguments\n");
 		//fprintf(stderr, "Usage: ./t <threads> <duration in seconds> <samples per second> <rapl1> <rapl2>\n");
@@ -1168,6 +1160,10 @@ int main(int argc, char **argv)
 	double rapl2 = (double) atof(argv[5]);
 	DIST_THRESH = (double) atof(argv[6]);
 	PCT_THRESH = (double) atof(argv[7]);
+	NUM_CPU = atoi(argv[9]);
+	MAX_NON_TURBO = (double) atof(argv[10]);
+	MAX_PSTATE = (unsigned long) strtol(argv[11], NULL, 16);
+
 	powlim = rapl1;
 	if (argv[8][0] == 'c')
 	{
@@ -1269,23 +1265,11 @@ int main(int argc, char **argv)
 	fprintf(stderr, "seconds unit: %lx\n", seconds_unit);
 	unsigned eu = (unit >> 8) & 0x1F;
 	energy_unit = 1.0 / (0x1 << eu);
-	//fprintf(stderr, "energy unit: %lx (%lf)\n", eu, energy_unit);
-	//dump_rapl_info(pu);
 
 	set_rapl(1, rapl1, pu, su, 0);
 	set_rapl2(16, rapl2, pu, su, 0);
 	
-	//dump_rapl();
-	//set_turbo_limit(0x21);
-	for (ctr = 0; ctr < 4; ctr++)
-	{
-		//write_msr_by_coord(0, 1, 0, 0x774, hwp_log_req);
-		//write_msr_by_coord(0, 1, 1, 0x774, hwp_log_req);
-		//write_msr_by_coord(0, 1, 0, 0x774, hwp_log_req);
-		//write_msr_by_coord(0, 1, 1, 0x774, hwp_log_req);
-		//set_perf(0x2D, ctr);
-	}
-	set_perf(0x2D);
+	set_perf(MAX_PSTATE);
 
 	thread_samples = (struct data_sample **) calloc(THREADCOUNT, sizeof(struct data_sample *));
 	FILE **output = (FILE **) calloc(THREADCOUNT, sizeof(FILE *));
@@ -1305,7 +1289,7 @@ int main(int argc, char **argv)
 		snprintf((char *) fname, FNAMESIZE, "core%d.msrdat", i);
 		output[i] = fopen(fname, "w");
 	}
-	set_perf(0x2D);
+	set_perf(MAX_PSTATE);
 
 	fprintf(stdout, "Initialization complete...\n");
 	//sleep(0.25);
@@ -1341,22 +1325,7 @@ int main(int argc, char **argv)
 			ovf_ctr++;
 		}
 		pow_aware_perf();
-		
-		//sample_data(6);
 		usleep(srate);
-		// distribute the sampling over the threads
-		//samplethread = (samplethread + 1) % THREADCOUNT;
-		/*
-		gettimeofday(&current, NULL);
-		durctr = ((double) (current.tv_sec - start.tv_sec) + 
-			(current.tv_usec - start.tv_usec) / 1000000.0);
-		avgrate += durctr - lasttv;
-		lasttv = durctr;
-		for (ctr = 0; ctr < 4; ctr++)
-		{
-			//set_perf(0x2D, ctr);
-		}
-		*/
 	}
 	
 	gettimeofday(&current, NULL);
@@ -1372,7 +1341,7 @@ int main(int argc, char **argv)
 	fprintf(sreport, "Actual run time: %f\n", aruntime);
 	fprintf(sreport, "Average Sampling Rate: %lf seconds\n", avgrate);
 	fprintf(sreport, "Dumping data file(s)...\n");
-	fprintf(sreport, "Avg Frq: %f\n", (float) (aperf_after - aperf_before) / (float) (mperf_after - mperf_before) * 4.2);
+	fprintf(sreport, "Avg Frq: %f\n", (float) (aperf_after - aperf_before) / (float) (mperf_after - mperf_before) * MAX_NON_TURBO);
 	fprintf(sreport, "Instructions: %lu (ovf %u)\n", inst_after - inst_before, ovf_ctr);
 	fprintf(sreport, "IPS: %lf (ovf %u)\n", (inst_after - inst_before) / aruntime, ovf_ctr);
 	FILE *ins = fopen("instret", "w");
