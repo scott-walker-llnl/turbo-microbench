@@ -1,3 +1,4 @@
+// Copyright 2018, Scott Walker
 #define _BSD_SOURCE
 #define _GNU_SOURCE
 #include "msr_core.h"
@@ -758,8 +759,7 @@ int branch_same_phase(struct phase_profile *this_profile, uint64_t perf, char wa
 
 	struct phase_profile scaled_profile = *this_profile;
 	double dist_to_recent;
-	double freq = ((double) perf) / 10.0;
-	frequency_scale_phase(this_profile, freq, profiles[recentphase].avg_frq, &scaled_profile);
+	frequency_scale_phase(this_profile, phase_avgfrq, profiles[recentphase].avg_frq, &scaled_profile);
 	dist_to_recent = metric_distance(&scaled_profile, &profiles[recentphase], &prof_maximums, &prof_minimums);
 
 	if (dist_to_recent < DIST_THRESH)
@@ -779,7 +779,7 @@ int branch_same_phase(struct phase_profile *this_profile, uint64_t perf, char wa
 	printf("Phase has changed, dist to recent %lf\n", dist_to_recent);
 	printf("\trecent phase id %d: ipc %lf, epc %lf, freq %lf. new phase: ipc %lf, epc %lf, freq %lf\n",
 		recentphase, profiles[recentphase].ipc, profiles[recentphase].epc, profiles[recentphase].avg_frq,
-		this_profile->ipc, this_profile->epc, freq);
+		this_profile->ipc, this_profile->epc, phase_avgfrq);
 #endif
 	return 0;
 }
@@ -806,7 +806,6 @@ int branch_change_phase(struct phase_profile *this_profile, uint64_t perf, char 
 
 	struct phase_profile min_scaled_profile;
 	double min_dist = DBL_MAX;
-	double freq = ((double) perf) / 10.0;
 	int numunder = 0;
 	int min_idx = -1;
 	int i;
@@ -818,7 +817,7 @@ int branch_change_phase(struct phase_profile *this_profile, uint64_t perf, char 
 			continue;
 		}
 		struct phase_profile scaled_profile;
-		frequency_scale_phase(this_profile, freq, profiles[i].avg_frq, &scaled_profile);
+		frequency_scale_phase(this_profile, phase_avgfrq, profiles[i].avg_frq, &scaled_profile);
 		distances[i] = metric_distance(&scaled_profile, &profiles[i], &prof_maximums, &prof_minimums);
 
 		if (distances[i] < min_dist)
@@ -1482,7 +1481,7 @@ int main(int argc, char **argv)
 	FILE *profout = fopen(fname, "w");
 	//dump_phaseinfo(stdout, NULL);
 	// TODO: figure out if miscounts from remove_unused or something else
-	/* remove_unused(); */
+	remove_unused();
 	agglomerate_profiles();
 	printf("phase results\n");
 	dump_phaseinfo(profout, &avgrate);
