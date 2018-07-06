@@ -14,31 +14,46 @@
 #include <signal.h>
 #include <float.h>
 
+/* #define DEBUG */
+
 #define FNAMESIZE 32
 #define MSR_TURBO_RATIO_LIMIT 0x1AD
 #define MSR_CORE_PERF_LIMIT_REASONS 0x64F
 #define THROTTLE_THRESH 100
-#define IPC_THRESH 0.9 // threshold for identifying new phases based on instructions per cycle
-#define MPC_THRESH 0.9 // threshold for identifying new phases based on LLC misses per cycle
-#define RPC_THRESH 0.9 // threshold for identifying new phases based on resource stalls per cycle
-#define EPC_THRESH 0.9 // threshold for identifying new phases based on execution stalls per cycle
-#define BPC_THRESH 0.9 // threshold for identifying new phases based on branch instructions per cycle
 #define LIMIT_ON_RAPL 0x0000C00
 #define LIMIT_LOG_RAPL 0xC000000
 #define LIMIT_LOG_MASK 0xF3FFFFFF
 #define MAX_PROFILES 20
 //#define DIST_THRESH 0.25
 //#define PCT_THRESH 0.01
-#define PRUNE_THRESH 0.000001
+/* #define PRUNE_THRESH 0.000001 */
 #define MAX_HISTORY 8
 #define NUM_CLASSES 4
 #define FUP_TIMEOUT 3
-
 #define TDP_SORTA 93.0
-
 #define FDELTA 1
 
+#define CLASS_CPU_SLOPE_IPC 0.63396
+#define CLASS_CPU_SLOPE_EPC 0.13005
+#define CLASS_MEM_SLOPE_IPC 0.07642
+#define CLASS_MEM_SLOPE_EPC 0.73337
+#define CLASS_MIX_SLOPE_IPC ((CLASS_CPU_SLOPE_IPC + CLASS_MEM_SLOPE_IPC) / 2)
+#define CLASS_MIX_SLOPE_EPC ((CLASS_CPU_SLOPE_EPC + CLASS_MEM_SLOPE_EPC) / 2 )
+#define CLASS_CPU_INTERCEPT_IPC 0.10806
+#define CLASS_CPU_INTERCEPT_EPC -0.12874
+#define CLASS_MEM_INTERCEPT_IPC 0.08295
+#define CLASS_MEM_INTERCEPT_EPC -0.20863
+#define CLASS_MIX_INTERCEPT_IPC ((CLASS_CPU_INTERCEPT_IPC + CLASS_MEM_INTERCEPT_IPC) / 2)
+#define CLASS_MIX_INTERCEPT_EPC ((CLASS_CPU_INTERCEPT_EPC + CLASS_MEM_INTERCEPT_EPC) / 2 )
+
 //#define MAN_TEST
+enum CLASS_ID
+{
+	CLASS_CPU,
+	CLASS_MEM,
+	CLASS_IO,
+	CLASS_MIX
+};
 
 struct data_sample
 {
@@ -101,31 +116,20 @@ int NUM_CPU = -1;
 
 int LOOP_CTRL = 1;
 
+// Prototypes
 void set_perf(const unsigned freq);
 void dump_phaseinfo(FILE *outfile, double *avgrate);
+void frequency_scale_phase(struct phase_profile *unscaled_profile, double frq_source, double frq_target, 
+		struct phase_profile *scaled_profile);
 
 double metric_distance(struct phase_profile *old, struct phase_profile *new, struct phase_profile *maximums, 
-	struct phase_profile *minimums, uint64_t new_perf, uint64_t old_perf)
+	struct phase_profile *minimums)
 {
 	double ipcnorm = ((old->ipc - minimums->ipc) / (maximums->ipc - minimums->ipc)) -
 					 ((new->ipc - minimums->ipc) / (maximums->ipc - minimums->ipc));
-	//ipcnorm *= new_perf / old_perf;
-
-	//double mpcnorm = ((old->mpc - minimums->mpc) / (maximums->mpc - minimums->mpc)) -
-	//				 ((new->mpc - minimums->mpc) / (maximums->mpc - minimums->mpc));
-	//mpcnorm *= new_perf / old_perf;
-
-	//double rpcnorm = ((old->rpc - minimums->rpc) / (maximums->rpc - minimums->rpc)) -
-	//				 ((new->rpc - minimums->rpc) / (maximums->rpc - minimums->rpc));
-	//rpcnorm *= new_perf / old_perf;
 
 	double epcnorm = ((old->epc - minimums->epc) / (maximums->epc - minimums->epc)) -
 					 ((new->epc - minimums->epc) / (maximums->epc - minimums->epc));
-	//epcnorm *= new_perf / old_perf;
-
-	//double bpcnorm = ((old->bpc - minimums->bpc) / (maximums->bpc - minimums->bpc)) -
-	//				 ((new->bpc - minimums->bpc) / (maximums->bpc - minimums->bpc));
-	//bpcnorm *= new_perf / old_perf;
 	
 	//return sqrt(pow(ipcnorm, 2.0) + pow(mpcnorm, 2.0) + pow(rpcnorm, 2.0) + pow(epcnorm, 2.0) + pow(bpcnorm, 2.0));
 	return sqrt(pow(ipcnorm, 2.0) + pow(epcnorm, 2.0));
@@ -164,9 +168,7 @@ void agglomerate_profiles()
 		{
 			if (i != j && valid[j])
 			{
-				double dist = metric_distance(&old_profiles[i], &old_profiles[j], &prof_maximums, 
-						&prof_minimums, (uint64_t) (old_profiles[i].avg_frq * 10.0),
-						(uint64_t) (old_profiles[j].avg_frq * 10.0));
+				double dist = metric_distance(&old_profiles[i], &old_profiles[j], &prof_maximums, &prof_minimums);
 				if (dist < DIST_THRESH)
 				{
 					matches[j] = 1;
@@ -194,38 +196,41 @@ void agglomerate_profiles()
 			{
 				if (i != j && matches[j])
 				{
+					struct phase_profile scaled_profile;
+					frequency_scale_phase(&old_profiles[j], old_profiles[j].avg_frq, 
+							old_profiles[i].avg_frq, &scaled_profile);
 					//printf("(glom) combining %d and %d\n", i, j);
 					if (j == recentphase)
 					{
 						recentphase = newidx;
 					}
-					profiles[newidx].ipc += old_profiles[j].ipc * 
-							(old_profiles[j].occurrences / (double) occurrence_sum);
-					profiles[newidx].mpc += old_profiles[j].mpc * 
-							(old_profiles[j].occurrences / (double) occurrence_sum);
-					profiles[newidx].rpc += old_profiles[j].rpc * 
-							(old_profiles[j].occurrences / (double) occurrence_sum);
-					profiles[newidx].epc += old_profiles[j].epc * 
-							(old_profiles[j].occurrences / (double) occurrence_sum);
-					profiles[newidx].bpc += old_profiles[j].bpc * 
-							(old_profiles[j].occurrences / (double) occurrence_sum);
-					profiles[newidx].num_throttles += old_profiles[j].num_throttles * 
-							(old_profiles[j].occurrences / (double) occurrence_sum);
-					profiles[newidx].avg_cycle += old_profiles[j].avg_cycle * 
-							(old_profiles[j].occurrences / (double) occurrence_sum);
+					profiles[newidx].ipc += scaled_profile.ipc * 
+							(scaled_profile.occurrences / (double) occurrence_sum);
+					profiles[newidx].mpc += scaled_profile.mpc * 
+							(scaled_profile.occurrences / (double) occurrence_sum);
+					profiles[newidx].rpc += scaled_profile.rpc * 
+							(scaled_profile.occurrences / (double) occurrence_sum);
+					profiles[newidx].epc += scaled_profile.epc * 
+							(scaled_profile.occurrences / (double) occurrence_sum);
+					profiles[newidx].bpc += scaled_profile.bpc * 
+							(scaled_profile.occurrences / (double) occurrence_sum);
+					profiles[newidx].num_throttles += scaled_profile.num_throttles * 
+							(scaled_profile.occurrences / (double) occurrence_sum);
+					profiles[newidx].avg_cycle += scaled_profile.avg_cycle * 
+							(scaled_profile.occurrences / (double) occurrence_sum);
 
-					if (old_profiles[j].frq_high > profiles[newidx].frq_high)
+					if (scaled_profile.frq_high > profiles[newidx].frq_high)
 					{
-						profiles[newidx].frq_high = old_profiles[j].frq_high;
+						profiles[newidx].frq_high = scaled_profile.frq_high;
 					}
-					if (old_profiles[j].frq_low < profiles[newidx].frq_low)
+					if (scaled_profile.frq_low < profiles[newidx].frq_low)
 					{
-						profiles[newidx].frq_low = old_profiles[j].frq_low;
+						profiles[newidx].frq_low = scaled_profile.frq_low;
 					}
-					profiles[newidx].occurrences += old_profiles[j].occurrences;
+					profiles[newidx].occurrences += scaled_profile.occurrences;
 
 					// TODO
-					profiles[newidx].avg_frq += old_profiles[j].avg_frq;
+					profiles[newidx].avg_frq += scaled_profile.avg_frq;
 					numglom++;
 				}
 			}
@@ -567,26 +572,43 @@ void add_profile(struct phase_profile *this_profile, uint64_t perf, unsigned thi
 	profiles[numphases].unthrot_count = 0;
 
 	numphases++;
+#ifdef DEBUG
+	printf("Added new phase profile %d\n", numphases);
+#endif
 }
 
-void classify_and_react(int phase, char isthrottled, char wasthrottled, uint64_t perf)
+// TODO: need maximums/minimums to take class values into account?
+int classify_phase(struct phase_profile *phase, uint64_t perf)
 {
+	int i = -1;
 	int minidx = -1;
 	double mindist = DBL_MAX;
-	int i;
+	prof_class[0].ipc = perf * CLASS_CPU_SLOPE_IPC + CLASS_CPU_INTERCEPT_IPC;
+	prof_class[0].epc = perf * CLASS_CPU_SLOPE_EPC + CLASS_CPU_INTERCEPT_EPC;
+	prof_class[1].ipc = perf * CLASS_MEM_SLOPE_IPC + CLASS_MEM_INTERCEPT_IPC;
+	prof_class[1].epc = perf * CLASS_MEM_SLOPE_EPC + CLASS_MEM_INTERCEPT_EPC;
+	// skip IO class, it doesn't change much
+	prof_class[3].ipc = perf * CLASS_MIX_SLOPE_IPC + CLASS_MIX_INTERCEPT_IPC;
+	prof_class[3].epc = perf * CLASS_MIX_SLOPE_EPC + CLASS_MIX_INTERCEPT_EPC;
 	for (i = 0; i < NUM_CLASSES; i++)
 	{
-		double dist = metric_distance(&profiles[phase], &prof_class[i], &prof_maximums, &prof_minimums,
-				perf, MAX_PSTATEul);
+		double dist = metric_distance(phase, &prof_class[i], &prof_maximums, &prof_minimums);
 		if (dist < mindist)
 		{
 			mindist = dist;
 			minidx = i;
 		}
 	}
-	switch (minidx)
+	phase->class = minidx;
+	return minidx;
+}
+
+void classify_and_react(int phase, char isthrottled, char wasthrottled, uint64_t perf)
+{
+	int class = classify_phase(&profiles[phase], perf);
+	switch (class)
 	{
-		case 0:
+		case CLASS_CPU:
 			// is CPU phase
 			if (wasthrottled)
 			{
@@ -625,7 +647,7 @@ void classify_and_react(int phase, char isthrottled, char wasthrottled, uint64_t
 			}
 			profiles[phase].class = 0;
 			break;
-		case 1:
+		case CLASS_MEM:
 			// is MEM phase
 			/*
 			if (wasthrottled)
@@ -639,15 +661,15 @@ void classify_and_react(int phase, char isthrottled, char wasthrottled, uint64_t
 			}
 			*/
 			//set_perf((unsigned long) (4.5 * (powlim / TDP_SORTA) * 10.0));
-			set_perf(0x1A);
+			set_perf(0x2A);
 			profiles[phase].class = 1;
 			break;
-		case 2:
+		case CLASS_IO:
 			// is IO phase
 			set_perf(0x2A); // seems counterintiutive but, yes, this should be high
 			profiles[phase].class = 2;
 			break;
-		case 3:
+		case CLASS_MIX:
 			// is MIXED phase
 			if (wasthrottled)
 			{
@@ -674,10 +696,186 @@ void classify_and_react(int phase, char isthrottled, char wasthrottled, uint64_t
 	}
 }
 
+// TODO: scaling is off
+void frequency_scale_phase(struct phase_profile *unscaled_profile, double frq_source, double frq_target, 
+		struct phase_profile *scaled_profile)
+{
+	*scaled_profile = *unscaled_profile;
+	// if the frequencies are already close then just return the copy, don't scale
+	if (frq_target + 0.1 > frq_source && frq_target - 0.1 < frq_source)
+	{
+		return;
+	}
+	double cpuipc = frq_source * CLASS_CPU_SLOPE_IPC + CLASS_CPU_INTERCEPT_IPC;
+	double memipc = frq_source * CLASS_MEM_SLOPE_IPC + CLASS_MEM_INTERCEPT_IPC;
+	double ipc_percent = (unscaled_profile->ipc - memipc) / (cpuipc - memipc);
+
+	double cpuepc = frq_source * CLASS_CPU_SLOPE_EPC + CLASS_CPU_INTERCEPT_EPC;
+	double memepc = frq_source * CLASS_MEM_SLOPE_EPC + CLASS_MEM_INTERCEPT_EPC;
+	// cpu and mem switched here because CPU has minimum in this case
+	double epc_percent = (unscaled_profile->epc - cpuepc) / (memepc - cpuepc);
+
+	// TODO: this threshold should be a variable
+	// if the percentages do not add close to 1, then this data point is atypical so don't scale it
+	if (ipc_percent + epc_percent < 0.8)
+	{
+		return;
+	}
+	scaled_profile->ipc = ((ipc_percent * CLASS_CPU_SLOPE_IPC) + ((1.0 - ipc_percent) * CLASS_MEM_SLOPE_IPC)) * 
+		frq_target + (ipc_percent * CLASS_CPU_INTERCEPT_IPC) + ((1.0 - ipc_percent) * CLASS_MEM_SLOPE_IPC);
+	scaled_profile->epc = ((epc_percent * CLASS_MEM_SLOPE_EPC) + ((1.0 - epc_percent) * CLASS_CPU_SLOPE_EPC)) * 
+		frq_target + (epc_percent * CLASS_MEM_INTERCEPT_EPC) + ((1.0 - epc_percent) * CLASS_CPU_SLOPE_EPC);
+	if (scaled_profile->ipc < 0.0)
+	{
+		scaled_profile->ipc = 0.0;
+	}
+	if (scaled_profile->epc < 0.0)
+	{
+		scaled_profile->epc = 0.0;
+	}
+	if (scaled_profile->ipc > 4.0 || scaled_profile->epc > 4.0)
+	{
+		printf("\nfrq source %lf, frq target %lf\n", frq_source, frq_target);
+		printf("ipc scale from %lf to %lf\nepc scaled from %lf to %lf\n", unscaled_profile->ipc, scaled_profile->ipc,
+				unscaled_profile->epc, scaled_profile->epc);
+		printf("ipc percent %lf, epc percent %lf\n", ipc_percent, epc_percent);
+	}
+#ifdef DEBUG
+	printf("\nfrq source %lf, frq target %lf\n", frq_source, frq_target);
+	printf("ipc scale from %lf to %lf\nepc scaled from %lf to %lf\n", unscaled_profile->ipc, scaled_profile->ipc,
+			unscaled_profile->epc, scaled_profile->epc);
+	printf("ipc percent %lf, epc percent %lf\n", ipc_percent, epc_percent);
+#endif
+}
+
+int branch_same_phase(struct phase_profile *this_profile, uint64_t perf, char wasthrottled, 
+		char isthrottled, double phase_avgfrq)
+{
+	if (recentphase < 0)
+	{
+		return 0;
+	}
+
+	struct phase_profile scaled_profile = *this_profile;
+	double dist_to_recent;
+	double freq = ((double) perf) / 10.0;
+	frequency_scale_phase(this_profile, freq, profiles[recentphase].avg_frq, &scaled_profile);
+	dist_to_recent = metric_distance(&scaled_profile, &profiles[recentphase], &prof_maximums, &prof_minimums);
+
+	if (dist_to_recent < DIST_THRESH)
+	{
+#ifdef DEBUG
+		printf("Phase has not changed, dist to recent %lf\n", dist_to_recent);
+#endif
+		// we are in the same phase, update it
+		update_profile(&scaled_profile, recentphase, perf, wasthrottled, phase_avgfrq, recentphase);
+		if (MAN_CTRL)
+		{
+			classify_and_react(recentphase, isthrottled, wasthrottled, perf);
+		}
+		return 1;
+	}
+#ifdef DEBUG
+	printf("Phase has changed, dist to recent %lf\n", dist_to_recent);
+	printf("\trecent phase id %d: ipc %lf, epc %lf, freq %lf. new phase: ipc %lf, epc %lf, freq %lf\n",
+		recentphase, profiles[recentphase].ipc, profiles[recentphase].epc, profiles[recentphase].avg_frq,
+		this_profile->ipc, this_profile->epc, freq);
+#endif
+	return 0;
+}
+
+int branch_change_phase(struct phase_profile *this_profile, uint64_t perf, char wasthrottled, 
+		char isthrottled, double phase_avgfrq)
+{
+	// we are in a different phase so search for the best match
+	double distances[MAX_PROFILES];
+	int k;
+	for (k = 0; k < numphases; k++)
+	{
+		distances[k] = DBL_MAX;
+	}
+
+	if (this_profile->ipc == 0.0 || this_profile->epc == 0.0)
+	{
+		printf("ERROR: bad profile data\n");
+	}
+
+#ifdef DEBUG
+		printf("Search for most similar phase\n");
+#endif
+
+	struct phase_profile min_scaled_profile;
+	double min_dist = DBL_MAX;
+	double freq = ((double) perf) / 10.0;
+	int numunder = 0;
+	int min_idx = -1;
+	int i;
+	for (i = 0; i < numphases; i++)
+	{
+		// measure the distance to every known phase
+		if (i == recentphase)
+		{
+			continue;
+		}
+		struct phase_profile scaled_profile;
+		frequency_scale_phase(this_profile, freq, profiles[i].avg_frq, &scaled_profile);
+		distances[i] = metric_distance(&scaled_profile, &profiles[i], &prof_maximums, &prof_minimums);
+
+		if (distances[i] < min_dist)
+		{
+			min_dist = distances[i];
+			min_idx = i;
+			min_scaled_profile = scaled_profile;
+		}
+		if (distances[i] < DIST_THRESH)
+		{
+			numunder++;
+		}
+	}
+
+#ifdef DEBUG
+	int q;
+	for (q = 0; q < numphases; q++)
+	{
+		printf("distance from %d to %d is %lf\n", numphases, q, distances[q]);
+	}
+#endif
+
+	if (min_idx >= 0 && min_dist < DIST_THRESH)
+	{
+		// we found an existing phase which matches the currently executing workload
+#ifdef DEBUG
+		printf("Found existing phase, with distance %lf\n", min_dist);
+#endif
+		update_profile(&min_scaled_profile, min_idx, perf, isthrottled, phase_avgfrq, recentphase);
+		recentphase = min_idx;
+		if (MAN_CTRL)
+		{
+			classify_and_react(recentphase, isthrottled, wasthrottled, perf);
+		}
+	}
+	else
+	{
+		// the currently executing workload has never been seen before
+		if (numphases >= MAX_PROFILES)
+		{
+			printf("ERROR: out of profile storage, increase the limit or change the sensitivity\n");
+			return -1;
+		}
+		// add new phase
+		add_profile(this_profile, perf, isthrottled, phase_avgfrq, recentphase);
+		recentphase = numphases - 1;
+	}
+
+	// if there are many matches, we should combine similar phases
+	if (numunder > 0)
+	{
+		agglomerate_profiles();
+	}
+}
+
 void pow_aware_perf()
 {
-	static uint64_t last_instret = 1;
-	static double last_ipc = 0, last_mpc = 0, last_rpc = 0, last_epc = 0, last_bpc = 0;
 	static uint64_t begin_aperf = 0, begin_mperf = 0;
 	static uint64_t last_aperf = 0, last_mperf = 0;
 	static uint64_t tsc_timer = 0;
@@ -720,16 +918,6 @@ void pow_aware_perf()
 
 	update_minmax(&this_profile, &prof_maximums, &prof_minimums);
 
-/*
-	double time = (thread_samples[0][SAMPLECTRS[0]].tsc_data - tsc_timer) /
-		(avgfrq * 1000000000.0);
-	if (time > 1.0 || numphases > MAX_PROFILES)
-	{
-		//printf("time step %lf\n", time);
-		tsc_timer = thread_samples[0][SAMPLECTRS[0]].tsc_data;
-		remove_unused();
-	}
-*/
 	if (numphases >= MAX_PROFILES)
 	{
 		remove_unused();
@@ -762,93 +950,20 @@ void pow_aware_perf()
 		isthrottled = 1;
 	}
 
-	double distances[MAX_PROFILES];
-	int k;
-	for (k = 0; k < numphases; k++)
+	// we may be in the same phase
+	if (branch_same_phase(&this_profile, perf, wasthrottled, isthrottled, phase_avgfrq))
 	{
-		distances[k] = DBL_MAX;
+		return;
 	}
-	if (recentphase >= 0)
+	// the phase changed
+	if (profiles[recentphase].avg_cycle < (thread_samples[0][SAMPLECTRS[0]].tsc_data - phase_start_tsc))
 	{
-		distances[recentphase] = metric_distance(&profiles[recentphase], &this_profile, &prof_maximums, 
-				&prof_minimums, (uint64_t) (profiles[recentphase].avg_frq * 10.0), perf);
-		if (distances[recentphase] < DIST_THRESH)
-		{
-			// we are in the same phase
-			// update existing phase
-			//printf("update recent\n");
-			update_profile(&this_profile, recentphase, perf, wasthrottled, phase_avgfrq, recentphase);
-			if (MAN_CTRL)
-			{
-				classify_and_react(recentphase, isthrottled, wasthrottled, perf);
-			}
-			return;
-		}
-		else
-		{
-			// the phase changed
-			if (profiles[recentphase].avg_cycle < (thread_samples[0][SAMPLECTRS[0]].tsc_data - phase_start_tsc))
-			{
-				profiles[recentphase].avg_cycle = (thread_samples[0][SAMPLECTRS[0]].tsc_data - phase_start_tsc);
-			}
-			phase_start_tsc = thread_samples[0][SAMPLECTRS[0]].tsc_data;
-			last_aperf = aperf;
-			last_mperf = mperf;
-		}
+		profiles[recentphase].avg_cycle = (thread_samples[0][SAMPLECTRS[0]].tsc_data - phase_start_tsc);
 	}
-	// we are in a new phase so search for the best match
-	double min_dist = DBL_MAX;
-	int numunder = 0;
-	int min_idx = -1;
-	int i;
-	for (i = 0; i < numphases; i++)
-	{
-		distances[i] = metric_distance(&profiles[i], &this_profile, &prof_maximums, &prof_minimums, 
-				(uint64_t) (profiles[i].avg_frq * 10.0), perf);
-		if (distances[i] < min_dist)
-		{
-			min_dist = distances[i];
-			min_idx = i;
-		}
-		if (distances[i] < DIST_THRESH)
-		{
-			numunder++;
-		}
-	}
-	if (min_idx >= 0 && min_dist < DIST_THRESH)
-	{
-		// update existing phase
-		//printf("update existing %d distance %lf\n", min_idx, min_dist);
-		update_profile(&this_profile, min_idx, perf, isthrottled, phase_avgfrq, recentphase);
-		recentphase = min_idx;
-		if (MAN_CTRL)
-		{
-			classify_and_react(recentphase, isthrottled, wasthrottled, perf);
-		}
-	}
-	else
-	{
-		if (numphases >= MAX_PROFILES)
-		{
-			return;
-		}
-		// add new phase
-		//printf("add new %d\n", numphases + 1);
-		add_profile(&this_profile, perf, isthrottled, phase_avgfrq, recentphase);
-#ifdef DEBUG
-		for (q = 0; q < numphases; q++)
-		{
-			printf("distance from %d to %d is %lf\n", numphases, q, distances[q]);
-		}
-#endif
-		//agglomerate_profiles();
-		//dump_phaseinfo(stdout, NULL);
-		recentphase = numphases - 1;
-	}
-	if (numunder > 0)
-	{
-		agglomerate_profiles();
-	}
+	phase_start_tsc = thread_samples[0][SAMPLECTRS[0]].tsc_data;
+	last_aperf = aperf;
+	last_mperf = mperf;
+	branch_change_phase(&this_profile, perf, wasthrottled, isthrottled, phase_avgfrq);
 }
 
 void set_perf(const unsigned freq)
@@ -955,8 +1070,9 @@ void dump_phaseinfo(FILE *outfile, double *avgrate)
 			double lpct = (double) profiles[j].occurrences / (double) recorded_steps;
 			if (lpct > PCT_THRESH)
 			{
-				double dist = metric_distance(&profiles[j], &profiles[i], &prof_maximums, &prof_minimums, 
-						(uint64_t) (profiles[j].avg_frq * 10.0), (uint64_t) (profiles[i].avg_frq * 10.0));
+				struct phase_profile scaled_profile;
+				frequency_scale_phase(&profiles[j], profiles[j].avg_frq, profiles[i].avg_frq, &scaled_profile);
+				double dist = metric_distance(&scaled_profile, &profiles[i], &prof_maximums, &prof_minimums);
 				fprintf(outfile, "\tdistance from %d: %lf\n", j, dist);
 			}
 		}
@@ -1180,29 +1296,34 @@ int main(int argc, char **argv)
 	powlim = rapl2;
 	printf("rapl limit 1 %lf, rapl limit 2 %lf\n", rapl1, rapl2);
 
-	prof_class[0].ipc = 2.75;
-    prof_class[0].mpc = 0.02;
-    prof_class[0].rpc = 0.20;
-    prof_class[0].epc = 0.50;
- 	prof_class[0].bpc = 0.01;
+	// these are the values at 800MHz, linear regression model based on frequency is used
+	// cpu phase
+	prof_class[0].ipc = 0.576;
+    prof_class[0].mpc = 0.005;
+    prof_class[0].rpc = 0.017;
+    prof_class[0].epc = 0.027;
+ 	prof_class[0].bpc = 0.0006;
 
-	prof_class[1].ipc = 0.5;
-    prof_class[1].mpc = 0.01;
-    prof_class[1].rpc = 0.8;
-    prof_class[1].epc = 3.1;
- 	prof_class[1].bpc = 0.05;
+	// memory phase
+	prof_class[1].ipc = 0.122;
+    prof_class[1].mpc = 0.004;
+    prof_class[1].rpc = 0.118;
+    prof_class[1].epc = 0.427;
+ 	prof_class[1].bpc = 0.017;
 
+	// IO/sleep phase (derived)
 	prof_class[2].ipc = 0;
     prof_class[2].mpc = 0;
     prof_class[2].rpc = 0;
     prof_class[2].epc = 0;
  	prof_class[2].bpc = 0;
 
-	prof_class[3].ipc = 1.2;
-    prof_class[3].mpc = 0.01;
-    prof_class[3].rpc = 0.20;
-    prof_class[3].epc = 1.50;
- 	prof_class[3].bpc = 0.01;
+	// mixed phase (derived)
+	prof_class[3].ipc = 0.349;
+    prof_class[3].mpc = 0.005;
+    prof_class[3].rpc = 0.06;
+    prof_class[3].epc = 0.25;
+ 	prof_class[3].bpc = 0.005;
 
 	cpu_set_t cpus;
 	CPU_ZERO(&cpus);
@@ -1289,7 +1410,8 @@ int main(int argc, char **argv)
 		snprintf((char *) fname, FNAMESIZE, "core%d.msrdat", i);
 		output[i] = fopen(fname, "w");
 	}
-	set_perf(MAX_PSTATE);
+	set_perf(0x2D);
+	/* set_perf(MAX_PSTATE); */
 
 	fprintf(stdout, "Initialization complete...\n");
 	//sleep(0.25);
@@ -1359,9 +1481,9 @@ int main(int argc, char **argv)
 	snprintf((char *) fname, FNAMESIZE, "profiles", i);
 	FILE *profout = fopen(fname, "w");
 	//dump_phaseinfo(stdout, NULL);
-	//agglomerate_profiles();
 	// TODO: figure out if miscounts from remove_unused or something else
-	remove_unused();
+	/* remove_unused(); */
+	agglomerate_profiles();
 	printf("phase results\n");
 	dump_phaseinfo(profout, &avgrate);
 
@@ -1376,4 +1498,4 @@ int main(int argc, char **argv)
 	fclose(sreport);
 
 	return 0;
-};
+}
