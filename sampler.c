@@ -5,6 +5,7 @@
 #include "msr_core.h"
 #include "master.h"
 #include "msr_counters.h"
+#include "msr_misc.h"
 #include <unistd.h>
 #include <stdlib.h>
 #include <stdint.h>
@@ -18,6 +19,7 @@
 
 /* #define DEBUG */
 
+#define TEMP_PSTATE 0xC
 #define FNAMESIZE 32
 #define MSR_TURBO_RATIO_LIMIT 0x1AD
 #define MSR_CORE_PERF_LIMIT_REASONS 0x64F
@@ -126,6 +128,7 @@ double MAX_NON_TURBO = 0.0;
 unsigned long MAX_PSTATE = 0x10ul;
 unsigned long MIN_PSTATE = 0x8ul;
 int NUM_CPU = -1;
+unsigned long numsamples;
 
 int LOOP_CTRL = 1;
 
@@ -360,21 +363,30 @@ void dump_rapl()
 	fprintf(stderr, "rapl is %lx\n", (unsigned long) rapl);
 }
 
-void enable_turbo(const unsigned tid)
+void enable_turbo()
 {
 	uint64_t perf_ctl;
-	read_msr_by_coord(0, tid, 0, IA32_PERF_CTL, &perf_ctl);
+	read_msr_by_coord(0, 0, 0, IA32_PERF_CTL, &perf_ctl);
 	perf_ctl &= 0xFFFFFFFEFFFFFFFFul;
-	write_msr_by_coord(0, tid, 0, IA32_PERF_CTL, perf_ctl);
-	write_msr_by_coord(0, tid, 1, IA32_PERF_CTL, perf_ctl);
+	int i;
+	for (i = 0; i < NUM_CPU; i++)
+	{
+		write_msr_by_coord(0, i, 0, IA32_PERF_CTL, perf_ctl);
+		write_msr_by_coord(1, i, 0, IA32_PERF_CTL, perf_ctl);
+	}
 }
 
-void disable_turbo(const unsigned tid)
+void disable_turbo()
 {
 	uint64_t perf_ctl;
-	read_msr_by_coord(0, tid, 0, IA32_PERF_CTL, &perf_ctl);
+	read_msr_by_coord(0, 0, 0, IA32_PERF_CTL, &perf_ctl);
 	perf_ctl |= 0x0000000100000000ul;
-	write_msr_by_coord(0, tid, 0, IA32_PERF_CTL, perf_ctl);
+	int i;
+	for (i = 0; i < NUM_CPU; i++)
+	{
+		write_msr_by_coord(0, i, 0, IA32_PERF_CTL, perf_ctl);
+		write_msr_by_coord(1, i, 0, IA32_PERF_CTL, perf_ctl);
+	}
 }
 
 void set_turbo_limit(unsigned int limit)
@@ -400,6 +412,10 @@ int sample_data(int core)
 	{
 		return -1;
 	}
+	if (SAMPLECTRS[core] >= numsamples)
+	{
+		return -1;
+	}
 	uint64_t perf;
 	uint64_t tsc;
 	uint64_t energy;
@@ -412,7 +428,7 @@ int sample_data(int core)
 	read_msr_by_coord(0, core, 0, IA32_PERF_STATUS, &perf);
 	read_msr_by_coord(0, core, 0, IA32_TIME_STAMP_COUNTER, &tsc);
 	read_msr_by_coord(0, core, 0, MSR_PKG_ENERGY_STATUS, &energy);
-	read_msr_by_coord(0, core, 0, MSR_PKG_PERF_STATUS, &rapl_throttled);
+	//read_msr_by_coord(0, core, 0, MSR_PKG_PERF_STATUS, &rapl_throttled);
 	read_msr_by_coord(0, core, 0, IA32_THERM_STATUS, &therm);
 	read_msr_by_coord(0, core, 0, IA32_FIXED_CTR0, &instret);
 	read_msr_by_coord(0, core, 0, MSR_CORE_PERF_LIMIT_REASONS, &perflimit);
@@ -633,34 +649,36 @@ void classify_and_react(int phase, double this_avgfrq, double this_ipc, char was
 	{
 		case CLASS_CPU:
 			// is CPU phase
-			set_perf(0x29);
-			/* if (wasthrottled) */
-			/* { */
-			/* 	set_perf(profiles[phase].frq_target - 1); */
-			/* 	if (perf < profiles[phase].frq_target) */
-			/* 	{ */
-			/* 		profiles[phase].frq_target--; */
-			/* 	} */
-			/* 	profiles[phase].unthrot_count = 0; */
-			/* } */
-			/* else */
-			/* { */
-			/* 	if (perf > profiles[phase].frq_target) */
-			/* 	{ */
-			/* 		profiles[phase].frq_target = perf; */
-			/* 	} */
-			/* 	if (profiles[phase].frq_target < MAX_PSTATE && */
-			/* 		profiles[phase].unthrot_count >= FUP_TIMEOUT) */
-			/* 	{ */
-			/* 		profiles[phase].frq_target++; */
-			/* 	} */
-			/* 	profiles[phase].unthrot_count++; */
-			/* 	set_perf(profiles[phase].frq_target); */
-			/* } */
+			set_perf(TEMP_PSTATE);
+			/*
+			if (wasthrottled) 
+			{ 
+				set_perf(profiles[phase].frq_target - 1); 
+				if (perf < profiles[phase].frq_target) 
+				{ 
+					profiles[phase].frq_target--; 
+				} 
+				profiles[phase].unthrot_count = 0; 
+			} 
+			else 
+			{ 
+				if (perf > profiles[phase].frq_target) 
+				{ 
+					profiles[phase].frq_target++; 
+				} 
+				if (profiles[phase].frq_target < MAX_PSTATE && 
+					profiles[phase].unthrot_count >= FUP_TIMEOUT) 
+				{ 
+					profiles[phase].frq_target++; 
+				} 
+				profiles[phase].unthrot_count++; 
+				set_perf(profiles[phase].frq_target); 
+			} 
+			*/
 			break;
 		case CLASS_MEM:
 			// is MEM phase
-			set_perf(0x27);
+			set_perf(TEMP_PSTATE);
 			/* if (wasthrottled) */
 			/* { */
 			/* 	// drop frequency directly */
@@ -680,10 +698,12 @@ void classify_and_react(int phase, double this_avgfrq, double this_ipc, char was
 			break;
 		case CLASS_IO:
 			// is IO phase
-			set_perf(0x2A); // seems counterintiutive but, yes, this should be high
+			set_perf((uint32_t) (MAX_NON_TURBO * 10)); // seems counterintiutive but, yes, this should be high
 			break;
 		case CLASS_MIX:
 			// is MIXED phase
+			set_perf(TEMP_PSTATE);
+			/*
 			if (wasthrottled)
 			{
 				set_perf((unsigned) (profiles[phase].avg_frq * 10) - FDELTA);
@@ -700,6 +720,7 @@ void classify_and_react(int phase, double this_avgfrq, double this_ipc, char was
 					set_perf((unsigned) (profiles[phase].avg_frq * 10) + FDELTA);
 				}
 			}
+			*/
 			break;
 		default:
 			printf("ERROR: no phase classification\n");
@@ -999,15 +1020,10 @@ void pow_aware_perf()
 
 void set_perf(const unsigned freq)
 {
-	static uint64_t perf_ctl = 0x0ul;
-	uint64_t freq_mask = 0x0ul;
-	if (perf_ctl == 0x0ul)
-	{
-		//read_msr_by_coord(0, tid, 0, IA32_PERF_CTL, &perf_ctl);
-		read_msr_by_coord(0, 0, 0, IA32_PERF_CTL, &perf_ctl);
-	}
+	uint64_t perf_ctl = 0x0ul;
+	uint64_t freq_mask = freq;
+	read_msr_by_coord(0, 0, 0, IA32_PERF_CTL, &perf_ctl);
 	perf_ctl &= 0xFFFFFFFFFFFF0000ul;
-	freq_mask = freq;
 	freq_mask <<= 8;
 	perf_ctl |= freq_mask;
 	//write_msr_by_coord(0, tid, 0, IA32_PERF_CTL, perf_ctl);
@@ -1016,7 +1032,9 @@ void set_perf(const unsigned freq)
 	for (i = 0; i < NUM_CPU; i++)
 	{
 		write_msr_by_coord(0, i, 0, IA32_PERF_CTL, perf_ctl);
-		write_msr_by_coord(0, i, 1, IA32_PERF_CTL, perf_ctl);
+		//write_msr_by_coord(0, i, 1, IA32_PERF_CTL, perf_ctl);
+		write_msr_by_coord(1, i, 0, IA32_PERF_CTL, perf_ctl);
+		//write_msr_by_coord(1, i, 1, IA32_PERF_CTL, perf_ctl);
 	}
 }
 
@@ -1131,12 +1149,11 @@ void dump_data(FILE **outfile, double durctr)
 				thread_samples[j][i].energy_data);
 
 
-			fprintf(outfile[j], "%f\t%llx\t%llu\t%lf\t%lu\t%u\t%lx\t%lu\t%lu\t%lu\t%lu\t%lu\n",
+			fprintf(outfile[j], "%f\t%llx\t%llu\t%lf\t%lu\t%u\t%lx\t%llu\t%lu\t%lu\t%lu\t%lu\n",
 				((thread_samples[j][i].frq_data & 0xFFFFul) >> 8) / 10.0,
 				(unsigned long long) (thread_samples[j][i].frq_data & 0xFFFFul),
 				//(unsigned long long) (thread_samples[j][i].tsc_data),
-				(unsigned long long) (thread_samples[j][i + 1].tsc_data -
-					thread_samples[j][i].tsc_data),
+				(unsigned long long) (thread_samples[j][i + 1].tsc_data - thread_samples[j][i].tsc_data),
 				diff * energy_unit / time,
 				(unsigned long long) ((thread_samples[j][i + 1].rapl_throttled & 0xFFFFFFFF) - (thread_samples[j][i].rapl_throttled & 0xFFFFFFFF)),
 				80 - ((thread_samples[j][i].therm & 0x7F0000) >> 16),
@@ -1221,31 +1238,34 @@ void hwpstuff()
 {
 	uint64_t hwp = 0x0;
 	read_msr_by_coord(0, 0, 0, 0x770, &hwp);
-	fprintf(sreport, "hwp %lx %s\n", hwp, (hwp == 0 ? "disabled" : "enabled"));
-	uint64_t hwp_cap = 0x0;
-	read_msr_by_coord(0, 0, 0, 0x771, &hwp_cap);
-	fprintf( sreport, "hwp cap %lx\n", hwp_cap);
-	uint64_t hwp_req = 0x0;
-	read_msr_by_coord(0, 0, 0, 0x772, &hwp_req);
-	fprintf( sreport, "hwp req %lx\n", hwp_req);
-	uint64_t hwp_int = 0x0;
-	read_msr_by_coord(0, 0, 0, 0x773, &hwp_int);
-	fprintf( sreport, "hwp int %lx\n", hwp_int);
-	uint64_t hwp_log_req = 0x0;
-	read_msr_by_coord(0, 0, 0, 0x774, &hwp_log_req);
-	fprintf( sreport, "hwp log req %lx\n", hwp_log_req);
-	uint64_t hwp_stat = 0x0;
-	read_msr_by_coord(0, 0, 0, 0x777, &hwp_stat);
-	fprintf( sreport, "hwp stat %lx\n", hwp_stat);
+	fprintf(stdout, "hwp %lx %s\n", hwp, (hwp == 0 ? "disabled" : "enabled"));
+	if (hwp != 0)
+	{
+		uint64_t hwp_cap = 0x0;
+		read_msr_by_coord(0, 0, 0, 0x771, &hwp_cap);
+		fprintf( stdout, "hwp cap %lx\n", hwp_cap);
+		uint64_t hwp_req = 0x0;
+		read_msr_by_coord(0, 0, 0, 0x772, &hwp_req);
+		fprintf( stdout, "hwp req %lx\n", hwp_req);
+		uint64_t hwp_int = 0x0;
+		read_msr_by_coord(0, 0, 0, 0x773, &hwp_int);
+		fprintf( stdout, "hwp int %lx\n", hwp_int);
+		uint64_t hwp_log_req = 0x0;
+		read_msr_by_coord(0, 0, 0, 0x774, &hwp_log_req);
+		fprintf( stdout, "hwp log req %lx\n", hwp_log_req);
+		uint64_t hwp_stat = 0x0;
+		read_msr_by_coord(0, 0, 0, 0x777, &hwp_stat);
+		fprintf( stdout, "hwp stat %lx\n", hwp_stat);
 
-	hwp_req = 0x14150Alu;
-	hwp_log_req = 0x14150Alu;
-	//write_msr_by_coord(0, 0, 0, 0x772, hwp_req);
-	//write_msr_by_coord(0, 0, 0, 0x772, hwp_req);
-	read_msr_by_coord(0, 0, 0, 0x772, &hwp_req);
-	fprintf( sreport, "hwp req %lx\n", hwp_req);
-	read_msr_by_coord(0, 0, 0, 0x774, &hwp_log_req);
-	fprintf( sreport, "hwp log req %lx\n", hwp_log_req);
+		hwp_req = 0x14150Alu;
+		hwp_log_req = 0x14150Alu;
+		//write_msr_by_coord(0, 0, 0, 0x772, hwp_req);
+		//write_msr_by_coord(0, 0, 0, 0x772, hwp_req);
+		read_msr_by_coord(0, 0, 0, 0x772, &hwp_req);
+		fprintf( stdout, "hwp req %lx\n", hwp_req);
+		read_msr_by_coord(0, 0, 0, 0x774, &hwp_log_req);
+		fprintf( stdout, "hwp log req %lx\n", hwp_log_req);
+	}
 }
 
 void signal_exit(int signum)
@@ -1271,10 +1291,15 @@ int main(int argc, char **argv)
 		return -1;
 	}
 
-	enable_turbo(0);
-	enable_turbo(1);
-	enable_turbo(2);
-	enable_turbo(3);
+	dump_rapl();
+
+	//disable_turbo();
+	enable_turbo();
+	printf("checking hwp\n");
+	hwpstuff();
+	uint64_t misc = 0;
+	read_msr_by_coord(0, 0, 0, 0x1A0, &misc);
+	printf("misc enable %lx\n", misc);
 
 	set_all_pmc_ctrl(0x0, 0x43, 0x41, 0x2E, 1); // LLC miss
 	set_all_pmc_ctrl(0x0, 0x43, 0x01, 0xA2, 2); // resource stalls
@@ -1325,6 +1350,19 @@ int main(int argc, char **argv)
 	}
 	powlim = rapl2;
 	printf("rapl limit 1 %lf, rapl limit 2 %lf\n", rapl1, rapl2);
+
+	uint64_t busy_tsc_pre[NUM_CPU * 2];
+	//uint64_t busy_unh_pre[NUM_CPU * 2];
+	int j;
+	for (j = 0; j < NUM_CPU; j++)
+	{
+		read_msr_by_coord(0, j, 0, IA32_TIME_STAMP_COUNTER, &busy_tsc_pre[j]);
+		read_msr_by_coord(1, j, 0, IA32_TIME_STAMP_COUNTER, &busy_tsc_pre[j + NUM_CPU]);
+		//read_msr_by_coord(0, j, 0, IA32_FIXED_CTR1, &busy_unh_pre[j]);
+		//read_msr_by_coord(1, j, 0, IA32_FIXED_CTR1, &busy_unh_pre[j + NUM_CPU]);
+		write_msr_by_coord(0, j , 0, IA32_FIXED_CTR1, 0x0ul);
+		write_msr_by_coord(1, j , 0, IA32_FIXED_CTR1, 0x0ul);
+	}
 
 	// these are the values at 800MHz, linear regression model based on frequency is used
 	// cpu phase
@@ -1382,7 +1420,7 @@ int main(int argc, char **argv)
 		write_msr_by_coord(0, ctr, 0, IA32_FIXED_CTR0, 0x0ul);
 		read_msr_by_coord(0, ctr, 0, IA32_PERF_GLOBAL_OVF_CTRL, &ovf_ctrl);
 		write_msr_by_coord(0, ctr, 0, IA32_PERF_GLOBAL_OVF_CTRL, ovf_ctrl & 0xFFFFFFFFFFFFFFFE);
-		write_msr_by_coord(0, ctr, 0, MSR_PKG_PERF_STATUS, 0);
+		//write_msr_by_coord(0, ctr, 0, MSR_PKG_PERF_STATUS, 0);
 	}
 
 // This is debug info
@@ -1414,12 +1452,12 @@ int main(int argc, char **argv)
 
 	set_rapl(1, rapl1, pu, su, 0);
 	set_rapl2(100, rapl2, pu, su, 0);
-	set_perf(MAX_PSTATE);
+	if (MAN_CTRL) set_perf(MAX_PSTATE);
 
 	thread_samples = (struct data_sample **) calloc(THREADCOUNT, sizeof(struct data_sample *));
 	FILE **output = (FILE **) calloc(THREADCOUNT, sizeof(FILE *));
 	SAMPLECTRS = (unsigned long *) calloc(THREADCOUNT, sizeof(unsigned long));
-	unsigned long numsamples = duration * sps;
+	numsamples = duration * sps * 1.1;
 	char fname[FNAMESIZE];
 	int i;
 	for (i = 0; i < THREADCOUNT; i++)
@@ -1434,8 +1472,7 @@ int main(int argc, char **argv)
 		snprintf((char *) fname, FNAMESIZE, "core%d.msrdat", i);
 		output[i] = fopen(fname, "w");
 	}
-	set_perf(0x2D);
-	/* set_perf(MAX_PSTATE); */
+	if (MAN_CTRL) set_perf(MAX_PSTATE);
 
 	fprintf(stdout, "Initialization complete...\n");
 	//sleep(0.25);
@@ -1500,7 +1537,22 @@ int main(int argc, char **argv)
 		free(thread_samples[i]);
 	}
 
-	snprintf((char *) fname, FNAMESIZE, "profiles", i);
+	for (j = 0; j < NUM_CPU; j++)
+	{
+		uint64_t busy_tsc_post, busy_unh_post;
+		read_msr_by_coord(0, j, 0, IA32_TIME_STAMP_COUNTER, &busy_tsc_post);
+		read_msr_by_coord(0, j, 0, IA32_FIXED_CTR1, &busy_unh_post);
+		double diff_unh = ((double) busy_unh_post);
+		double diff_tsc = ((double) busy_tsc_post - busy_tsc_pre[j]);
+		printf("s1c%d pct busy: %lf\% (%lf/%lf)\n", j,  diff_unh / diff_tsc * 100.0, diff_unh, diff_tsc);
+		read_msr_by_coord(1, j, 0, IA32_TIME_STAMP_COUNTER, &busy_tsc_post);
+		read_msr_by_coord(1, j, 0, IA32_FIXED_CTR1, &busy_unh_post);
+		diff_unh = ((double) busy_unh_post);
+		diff_tsc = ((double) busy_tsc_post - busy_tsc_pre[j + NUM_CPU]);
+		printf("s2c%d pct busy: %lf\% (%lf/%lf)\n", j,  diff_unh / diff_tsc * 100.0, diff_unh, diff_tsc);
+	}
+
+	snprintf((char *) fname, FNAMESIZE, "profiles %d", i);
 	FILE *profout = fopen(fname, "w");
 	//dump_phaseinfo(stdout, NULL);
 	// TODO: figure out if miscounts from remove_unused or something else (fixed?)
