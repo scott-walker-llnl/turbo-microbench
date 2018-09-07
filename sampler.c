@@ -1,44 +1,52 @@
-// Copyright 2018, Scott Walker
+// Copyright (C) 2018 The University of Arizona
+// Author: Scott Walker
 // License: GPLv3. See LICENSE file for details.
-#define _BSD_SOURCE
-#define _GNU_SOURCE
-#include "msr_core.h"
-#include "master.h"
-#include "msr_counters.h"
-#include "msr_misc.h"
+// Power Governor: An advanced performance governor that is power aware.
+
+
+#define _BSD_SOURCE // required for usleep
+#define _GNU_SOURCE // required for sched
 #include <unistd.h>
 #include <stdlib.h>
 #include <stdint.h>
 #include <sys/time.h>
+#include <sys/sysinfo.h>
 #include <string.h>
 #include <stdio.h>
 #include <math.h>
 #include <sched.h>
 #include <signal.h>
 #include <float.h>
+#include <assert.h>
 
-/* #define DEBUG */
+// Libmsr includes
+#include "msr_core.h"
+#include "master.h"
+#include "msr_counters.h"
+#include "msr_misc.h"
+#include "cpuid.h"
 
-#define TEMP_PSTATE 0xC
+
+//#define DEBUG
+#define CPUID_DEBUG
+#define VERSIONSTRING "0.1"
 #define FNAMESIZE 32
 #define MSR_TURBO_RATIO_LIMIT 0x1AD
 #define MSR_CORE_PERF_LIMIT_REASONS 0x64F
-#define THROTTLE_THRESH 100
 #define LIMIT_ON_RAPL 0x0000C00
 #define LIMIT_LOG_RAPL 0xC000000
 #define LIMIT_LOG_MASK 0xF3FFFFFF
 #define MAX_PROFILES 20
-//#define DIST_THRESH 0.25
-//#define PCT_THRESH 0.01
-/* #define PRUNE_THRESH 0.000001 */
 #define MAX_HISTORY 8
 #define NUM_CLASSES 4
-#define FUP_TIMEOUT 3
+#define FUP_TIMEOUT 100
 #define RECLASSIFY_INTERVAL 20
-#define TDP_SORTA 100.0
-#define FDELTA 1
 #define SCALE_OUTLIER_THRESH_LOW 0.8
 #define SCALE_OUTLIER_THRESH_HIGH 1.2
+#define MEM_FN1_LIM 5 
+#define MEM_FN2_LIM 10
+#define MEM_FN3_LIM 20
+#define MEM_FNRESET_LIM 250
 
 #define CLASS_CPU_SLOPE_IPC 0.63396
 #define CLASS_CPU_SLOPE_EPC 0.13005
@@ -54,7 +62,8 @@
 #define CLASS_MIX_INTERCEPT_IPC ((CLASS_CPU_INTERCEPT_IPC + CLASS_MEM_INTERCEPT_IPC) / 2)
 #define CLASS_MIX_INTERCEPT_EPC ((CLASS_CPU_INTERCEPT_EPC + CLASS_MEM_INTERCEPT_EPC) / 2 )
 
-//#define MAN_TEST
+
+// Structures
 enum CLASS_ID
 {
 	CLASS_CPU,
@@ -88,9 +97,6 @@ struct phase_profile
 	double epc; // execution stalls/cycle measured for this phase
 	double bpc; // branch instructions/cycle measured for this phase
 
-	double last_ipc;
-	double last_avgfrq;
-
 	double avg_frq; // average frequency measured for this phase
 	uint16_t frq_high; // max frequency measured for this phase
 	uint16_t frq_low; // min frequency measured for this phase
@@ -103,41 +109,108 @@ struct phase_profile
 	char class;
 	char unthrot_count;
 	char reclass_count;
+	char mem_duty_count;
 };
 
+struct powgov_sysconfig
+{
+	unsigned num_cpu; // number of cores present
+	double rapl_energy_unit;
+	double rapl_seconds_unit;
+	double rapl_power_unit;
+	double max_non_turbo;
+	double max_pstate;
+	double min_pstate;
+};
+
+struct powgov_files
+{
+	FILE *sreport; // main report file generated
+	FILE **sampler_dumpfiles; // report files for sampler
+	FILE *profout; // report file for profile clusters
+};
+
+struct powgov_sampler
+{
+	unsigned long *samplectrs; // counter for number of samples on each thread
+	struct data_sample **thread_samples;
+	unsigned long numsamples;
+	struct data_sample new_sample;
+	struct data_sample prev_sample;
+	unsigned sps;
+};
+
+struct powgov_classifier
+{
+	double dist_thresh; // the threshold for profile cluster identification
+	double pct_thresh; // the threshold for displaying dumped profiles as execution percent
+	int numphases; // the current number of phases
+	struct phase_profile profiles[MAX_PROFILES]; // the cluster centers
+	struct phase_profile prof_maximums; // minimum sampled values used for scaling and normalization
+	struct phase_profile prof_minimums; // minimum sampled values used for scaling and normalization
+	struct phase_profile prof_class[NUM_CLASSES]; // pre-computed values for various classes of workload
+	int recentphase;
+};
+
+struct powgov_runtime
+{
+	struct powgov_sysconfig *sys;
+	struct powgov_files *files;
+	struct powgov_sampler *sampler;
+	struct powgov_classifier *classifier;
+};
+
+// Globals
+int LOOP_CTRL = 1;
+int MAN_CTRL;
+double THREADCOUNT; // deprecated?
+double DURATION; // deprecated?
+double VERBOSE;
+double EXPERIMENTAL;
+double REPORT;
+char CLASS_NAMES[NUM_CLASSES + 1][8] = {"CPU\0", "MEM\0", "IO\0", "MIX\0", "UNK\0"};
+
+/*
+// flags from configuration and command line args
+double runtime->classifier->dist_thresh;
+double runtime->classifier->pct_thresh;
+// system configuration info
+int runtime->sys->num_cpu;
+double RAPL_ENERGY_UNIT;
+double RAPL_SECONDS_UNIT;
+double RAPL_POWER_UNIT;
+double runtime->sys->max_non_turbo;
+unsigned long runtime->sys->max_pstate;
+unsigned long runtime->sys->min_pstate = 0x8ul;
+
+// reporting
+FILE *sreport;
+
+// experimental
+unsigned long *SAMPLECTRS;
+struct data_sample **thread_samples;
+unsigned long numsamples;
+FILE **sampler_dumpfiles;
+
+// profile classification
+int numphases = 0;
 struct phase_profile profiles[MAX_PROFILES];
 struct phase_profile prof_maximums;
 struct phase_profile prof_minimums;
 struct phase_profile prof_class[NUM_CLASSES];
-char CLASS_NAMES[NUM_CLASSES + 1][8] = {"CPU\0", "MEM\0", "IO\0", "MIX\0", "UNK\0"};
-int numphases = 0;
-int recentphase = -1;
-int lastglom = 0;
-struct data_sample **thread_samples;
-unsigned THREADCOUNT;
-unsigned long *SAMPLECTRS;
-double DIST_THRESH = 0.25;
-double PCT_THRESH = 0.01;
-double energy_unit;
-double seconds_unit;
-double avg_sample_rate;
-double powlim = 0.0;
-FILE *sreport;
-char MAN_CTRL = 0;
-double MAX_NON_TURBO = 0.0;
-unsigned long MAX_PSTATE = 0x10ul;
-unsigned long MIN_PSTATE = 0x8ul;
-int NUM_CPU = -1;
-unsigned long numsamples;
+int runtime->classifier->recentphase = -1;
+*/
 
-int LOOP_CTRL = 1;
 
 // Prototypes
-void set_perf(const unsigned freq);
-void dump_phaseinfo(FILE *outfile, double *avgrate);
-void frequency_scale_phase(struct phase_profile *unscaled_profile, double frq_source, double frq_target, struct phase_profile *scaled_profile);
+void set_perf(struct powgov_runtime *runtime, const unsigned freq);
+void dump_phaseinfo(struct powgov_runtime *runtime, FILE *outfile, double *avgrate);
+void frequency_scale_phase(struct phase_profile *unscaled_profile, double frq_source, double frq_target, 
+		struct phase_profile *scaled_profile);
 double ipc_scale(double ipc_unscaled, double frq_source, double frq_target);
 
+
+// BEGIN PROGRAM
 double metric_distance(struct phase_profile *old, struct phase_profile *new, struct phase_profile *maximums,
 	struct phase_profile *minimums)
 {
@@ -151,11 +224,13 @@ double metric_distance(struct phase_profile *old, struct phase_profile *new, str
 }
 
 // TODO: weighted averaging should scale first
-void agglomerate_profiles()
+void agglomerate_profiles(struct powgov_runtime *runtime)
 {
 	struct phase_profile old_profiles[MAX_PROFILES];
 	int newidx = 0;
-	memcpy(old_profiles, profiles, numphases * sizeof(struct phase_profile));
+	struct phase_profile *profiles = runtime->classifier->profiles;
+	memcpy(old_profiles, profiles, 
+			runtime->classifier->numphases * sizeof(struct phase_profile));
 
 	//double dist[MAX_PROFILES];
 	//memset(dist, 0, sizeof(double) * MAX_PROFILES);
@@ -165,10 +240,10 @@ void agglomerate_profiles()
 
 	int numcombines = 0;
 
-	//printf("(glom) num phases %d\n", numphases);
+	//printf("(glom) num phases %d\n", runtime->classifier->numphases);
 
 	int i;
-	for (i = 0; i < numphases; i++)
+	for (i = 0; i < runtime->classifier->numphases; i++)
 	{
 		if (valid[i] == 0)
 		{
@@ -180,12 +255,13 @@ void agglomerate_profiles()
 		uint64_t occurrence_sum = old_profiles[i].occurrences;
 
 		int j;
-		for (j = 0; j < numphases; j++)
+		for (j = 0; j < runtime->classifier->numphases; j++)
 		{
 			if (i != j && valid[j])
 			{
-				double dist = metric_distance(&old_profiles[i], &old_profiles[j], &prof_maximums, &prof_minimums);
-				if (dist < DIST_THRESH)
+				double dist = metric_distance(&old_profiles[i], &old_profiles[j], 
+						&runtime->classifier->prof_maximums, &runtime->classifier->prof_minimums);
+				if (dist < runtime->classifier->dist_thresh)
 				{
 					matches[j] = 1;
 					matches[i] = 1;
@@ -198,7 +274,7 @@ void agglomerate_profiles()
 		}
 		if (matches[i])
 		{
-			memcpy(&profiles[newidx], &old_profiles[i], sizeof(struct phase_profile));
+			memcpy(&runtime->classifier->profiles[newidx], &old_profiles[i], sizeof(struct phase_profile));
 			profiles[newidx].ipc *= (profiles[newidx].occurrences / (double) occurrence_sum);
 			profiles[newidx].mpc *= (profiles[newidx].occurrences / (double) occurrence_sum);
 			profiles[newidx].rpc *= (profiles[newidx].occurrences / (double) occurrence_sum);
@@ -209,7 +285,7 @@ void agglomerate_profiles()
 			profiles[newidx].avg_cycle *= (profiles[newidx].occurrences / (double) occurrence_sum);
 			profiles[newidx].avg_frq *= (profiles[newidx].occurrences / (double) occurrence_sum);
 			int numglom = 1;
-			for (j = 0; j < numphases; j++)
+			for (j = 0; j < runtime->classifier->numphases; j++)
 			{
 				if (i != j && matches[j])
 				{
@@ -217,9 +293,9 @@ void agglomerate_profiles()
 					frequency_scale_phase(&old_profiles[j], old_profiles[j].avg_frq,
 							old_profiles[i].avg_frq, &scaled_profile);
 					//printf("(glom) combining %d and %d\n", i, j);
-					if (j == recentphase)
+					if (j == runtime->classifier->recentphase)
 					{
-						recentphase = newidx;
+						runtime->classifier->recentphase = newidx;
 					}
 					profiles[newidx].ipc += scaled_profile.ipc *
 							(scaled_profile.occurrences / (double) occurrence_sum);
@@ -258,7 +334,7 @@ void agglomerate_profiles()
 	if (numcombines > 0)
 	{
 		// slide everything over that wasn't combined
-		for (i = 0; i < numphases; i++)
+		for (i = 0; i < runtime->classifier->numphases; i++)
 		{
 			if (valid[i] && i == newidx)
 			{
@@ -268,25 +344,25 @@ void agglomerate_profiles()
 			else if (valid[i])
 			{
 				//printf("(glom) sliding %d to %d\n", i, newidx);
-				if (i == recentphase)
+				if (i == runtime->classifier->recentphase)
 				{
-					recentphase = newidx;
+					runtime->classifier->recentphase = newidx;
 				}
 				memcpy(&profiles[newidx], &old_profiles[i], sizeof(struct phase_profile));
-				profiles[newidx].lastprev = 0;
+				runtime->classifier->profiles[newidx].lastprev = 0;
 				memset(profiles[newidx].prev_phases, -1, MAX_HISTORY);
 
 				newidx++;
 			}
 		}
-		numphases = newidx;
+		runtime->classifier->numphases = newidx;
 	}
-	//printf("(glom) recentphase is now %d\n", recentphase);
+	//printf("(glom) runtime->classifier->recentphase is now %d\n", runtime->classifier->recentphase);
 }
 
-void remove_unused()
+void remove_unused(struct powgov_runtime *runtime)
 {
-	if (numphases <= 0)
+	if (runtime->classifier->numphases <= 0)
 	{
 		return;
 	}
@@ -298,8 +374,9 @@ void remove_unused()
 	memset(valid, 1, MAX_PROFILES);
 	int numinvalid = 0;
 	int firstinvalid = -1;
+	struct phase_profile *profiles = runtime->classifier->profiles;
 
-	for (i = 0; i < numphases; i++)
+	for (i = 0; i < runtime->classifier->numphases; i++)
 	{
 		//occurrence_sum += old_profiles[i].occurrences;
 		if (profiles[i].occurrences <= 1)
@@ -314,7 +391,7 @@ void remove_unused()
 		}
 	}
 	/*
-	for (i = 0; i < numphases; i++)
+	for (i = 0; i < runtime->classifier->numphases; i++)
 	{
 		if (old_profiles[i].occurrences / (double) occurrence_sum < PRUNE_THRESH)
 		{
@@ -330,10 +407,10 @@ void remove_unused()
 
 	struct phase_profile old_profiles[MAX_PROFILES];
 	int newidx = 0;
-	memcpy(old_profiles, profiles, numphases * sizeof(struct phase_profile));
+	memcpy(old_profiles, profiles, runtime->classifier->numphases * sizeof(struct phase_profile));
 
 	newidx = firstinvalid;
-	for (i = firstinvalid; i < numphases; i++)
+	for (i = firstinvalid; i < runtime->classifier->numphases; i++)
 	{
 		if (i == newidx && valid[i])
 		{
@@ -343,46 +420,46 @@ void remove_unused()
 		else if (valid[i])
 		{
 			//printf("(remove) sliding id %d to %d\n", i, newidx);
-			if (i == recentphase)
+			if (i == runtime->classifier->recentphase)
 			{
-				recentphase = newidx;
+				runtime->classifier->recentphase = newidx;
 			}
 			memcpy(&profiles[newidx], &old_profiles[i], sizeof(struct phase_profile));
 			newidx++;
 		}
 	}
-	numphases = newidx;
-	//printf("(remove) numphases is now %d\n", numphases);
-	//printf("(remove) recentphase is now %d\n", recentphase);
+ runtime->classifier->numphases = newidx;
+	//printf("(remove) runtime->classifier->numphases is now %d\n", runtime->classifier->numphases);
+	//printf("(remove) runtime->classifier->recentphase is now %d\n", runtime->classifier->recentphase);
 }
 
 void dump_rapl()
 {
 	uint64_t rapl;
 	read_msr_by_coord(0, 0, 0, MSR_PKG_POWER_LIMIT, &rapl);
-	fprintf(stderr, "rapl is %lx\n", (unsigned long) rapl);
+	fprintf(stderr, "\trapl is %lx\n", (unsigned long) rapl);
 }
 
-void enable_turbo()
+void enable_turbo(struct powgov_runtime *runtime)
 {
 	uint64_t perf_ctl;
 	read_msr_by_coord(0, 0, 0, IA32_PERF_CTL, &perf_ctl);
 	perf_ctl &= 0xFFFFFFFEFFFFFFFFul;
 	int i;
-	for (i = 0; i < NUM_CPU; i++)
+	for (i = 0; i < runtime->sys->num_cpu; i++)
 	{
 		write_msr_by_coord(0, i, 0, IA32_PERF_CTL, perf_ctl);
 		write_msr_by_coord(1, i, 0, IA32_PERF_CTL, perf_ctl);
 	}
 }
 
-void disable_turbo()
+void disable_turbo(struct powgov_runtime *runtime)
 {
 	uint64_t perf_ctl;
 	read_msr_by_coord(0, 0, 0, IA32_PERF_CTL, &perf_ctl);
 	perf_ctl |= 0x0000000100000000ul;
 	int i;
-	for (i = 0; i < NUM_CPU; i++)
+	for (i = 0; i < runtime->sys->num_cpu; i++)
 	{
 		write_msr_by_coord(0, i, 0, IA32_PERF_CTL, perf_ctl);
 		write_msr_by_coord(1, i, 0, IA32_PERF_CTL, perf_ctl);
@@ -402,20 +479,19 @@ void dump_rapl_info(double power_unit)
 {
 	uint64_t rapl_info;
 	read_msr_by_coord(0, 0, 0, MSR_PKG_POWER_INFO, &rapl_info);
-	fprintf(stderr, "RAPL INFO:\n\tTDP %lf (raw %lx)\n",
+	fprintf(stderr, "\tRAPL INFO:\n\tTDP %lf (raw %lx)\n",
 		(rapl_info & 0xEF) * power_unit, rapl_info & 0xEF);
 }
 
-int sample_data(int core)
+int sample_data(struct powgov_runtime *runtime)
 {
+	// TODO: core stuff for multiple thread sampling
+	int core = 0;
 	if (core > THREADCOUNT || core < 0)
 	{
 		return -1;
 	}
-	if (SAMPLECTRS[core] >= numsamples)
-	{
-		return -1;
-	}
+	
 	uint64_t perf;
 	uint64_t tsc;
 	uint64_t energy;
@@ -433,18 +509,42 @@ int sample_data(int core)
 	read_msr_by_coord(0, core, 0, IA32_FIXED_CTR0, &instret);
 	read_msr_by_coord(0, core, 0, MSR_CORE_PERF_LIMIT_REASONS, &perflimit);
 	read_batch(COUNTERS_DATA);
-	SAMPLECTRS[core]++;
-	thread_samples[core][SAMPLECTRS[core]].frq_data = perf;
-	thread_samples[core][SAMPLECTRS[core]].tsc_data = tsc;
-	thread_samples[core][SAMPLECTRS[core]].energy_data = energy & 0xFFFFFFFF;
-	thread_samples[core][SAMPLECTRS[core]].rapl_throttled = rapl_throttled & 0xFFFFFFFF;
-	thread_samples[core][SAMPLECTRS[core]].therm = therm;
-	thread_samples[core][SAMPLECTRS[core]].perflimit = perflimit;
-	thread_samples[core][SAMPLECTRS[core]].instret = instret;
-	thread_samples[core][SAMPLECTRS[core]].llcmiss = *pmcounters->pmc0[0];
-	thread_samples[core][SAMPLECTRS[core]].restalls = *pmcounters->pmc1[0];
-	thread_samples[core][SAMPLECTRS[core]].exstalls = *pmcounters->pmc2[0];
-	thread_samples[core][SAMPLECTRS[core]].branchret = *pmcounters->pmc3[0];
+	unsigned long idx = runtime->sampler->samplectrs[core]++;
+	if (EXPERIMENTAL)
+	{
+		if (runtime->sampler->samplectrs[core] >= runtime->sampler->numsamples)
+		{
+			return -1;
+		}
+		runtime->sampler->prev_sample = runtime->sampler->new_sample;
+		runtime->sampler->thread_samples[core][idx].frq_data = perf;
+		runtime->sampler->thread_samples[core][idx].tsc_data = tsc;
+		runtime->sampler->thread_samples[core][idx].energy_data = energy & 0xFFFFFFFF;
+		runtime->sampler->thread_samples[core][idx].rapl_throttled = rapl_throttled & 0xFFFFFFFF;
+		runtime->sampler->thread_samples[core][idx].therm = therm;
+		runtime->sampler->thread_samples[core][idx].perflimit = perflimit;
+		runtime->sampler->thread_samples[core][idx].instret = instret;
+		runtime->sampler->thread_samples[core][idx].llcmiss = *pmcounters->pmc0[0];
+		runtime->sampler->thread_samples[core][idx].restalls = *pmcounters->pmc1[0];
+		runtime->sampler->thread_samples[core][idx].exstalls = *pmcounters->pmc2[0];
+		runtime->sampler->thread_samples[core][idx].branchret = *pmcounters->pmc3[0];
+		runtime->sampler->new_sample = runtime->sampler->thread_samples[core][idx];
+	}
+	else
+	{
+		runtime->sampler->prev_sample = runtime->sampler->new_sample;
+		runtime->sampler->new_sample.frq_data = perf;
+		runtime->sampler->new_sample.tsc_data = tsc;
+		runtime->sampler->new_sample.energy_data = energy & 0xFFFFFFFF;
+		runtime->sampler->new_sample.rapl_throttled = rapl_throttled & 0xFFFFFFFF;
+		runtime->sampler->new_sample.therm = therm;
+		runtime->sampler->new_sample.perflimit = perflimit;
+		runtime->sampler->new_sample.instret = instret;
+		runtime->sampler->new_sample.llcmiss = *pmcounters->pmc0[0];
+		runtime->sampler->new_sample.restalls = *pmcounters->pmc1[0];
+		runtime->sampler->new_sample.exstalls = *pmcounters->pmc2[0];
+		runtime->sampler->new_sample.branchret = *pmcounters->pmc3[0];
+	}
 	return 0;
 }
 
@@ -499,14 +599,15 @@ void print_profile(struct phase_profile *prof)
 			prof->rpc, prof->epc, prof->bpc);
 }
 
-void update_profile(struct phase_profile *this_profile, int profidx, uint64_t perf, unsigned this_throttle,
+void update_profile(struct powgov_runtime *runtime, struct phase_profile *this_profile, int profidx, uint64_t perf, unsigned this_throttle,
 		double avgfrq, int lastphase)
 {
-	if (profidx > numphases)
+	if (profidx > runtime->classifier->numphases)
 	{
 		printf("ERROR: profile does not exist\n");
 		return;
 	}
+	struct phase_profile *profiles = runtime->classifier->profiles;
 
 	profiles[profidx].ipc = (profiles[profidx].ipc *
 			(profiles[profidx].occurrences / (profiles[profidx].occurrences + 1.0))) +
@@ -565,9 +666,11 @@ void update_profile(struct phase_profile *this_profile, int profidx, uint64_t pe
 	}
 }
 
-void add_profile(struct phase_profile *this_profile, uint64_t perf, unsigned this_throttle, double avgfrq,
+void add_profile(struct powgov_runtime *runtime, struct phase_profile *this_profile, uint64_t perf, unsigned this_throttle, double avgfrq,
 		int lastphase)
 {
+	int numphases = runtime->classifier->numphases;
+	struct phase_profile *profiles = runtime->classifier->profiles;
 	profiles[numphases].ipc = this_profile->ipc;
 	profiles[numphases].mpc = this_profile->mpc;
 	profiles[numphases].rpc = this_profile->rpc;
@@ -575,9 +678,9 @@ void add_profile(struct phase_profile *this_profile, uint64_t perf, unsigned thi
 	profiles[numphases].bpc = this_profile->bpc;
 
 	profiles[numphases].avg_frq = avgfrq;
-	profiles[numphases].frq_high = MIN_PSTATE;
-	profiles[numphases].frq_low = MAX_PSTATE;
-	profiles[numphases].frq_target = MAX_PSTATE;
+	profiles[numphases].frq_high = runtime->sys->min_pstate;
+	profiles[numphases].frq_low = runtime->sys->max_pstate;
+	profiles[numphases].frq_target = runtime->sys->max_pstate;
 	profiles[numphases].avg_cycle = 0;
 	profiles[numphases].num_throttles = this_throttle;
 	profiles[numphases].occurrences = 0;
@@ -587,19 +690,25 @@ void add_profile(struct phase_profile *this_profile, uint64_t perf, unsigned thi
 	profiles[numphases].class = 4;
 	profiles[numphases].unthrot_count = 0;
 	profiles[numphases].reclass_count = RECLASSIFY_INTERVAL;
+	profiles[numphases].mem_duty_count = 0;
+	/* profiles[numphases].mem_fn1_ctr = 0; */
+	/* profiles[numphases].mem_fn2_ctr = 0; */
+	/* profiles[numphases].mem_fn3_ctr = 0; */
+	/* profiles[numphases].mem_fnreset_ctr = 0; */
 
-	numphases++;
+	 runtime->classifier->numphases++;
 #ifdef DEBUG
-	printf("Added new phase profile %d\n", numphases);
+	printf("Added new phase profile %d\n", runtime->classifier->numphases);
 #endif
 }
 
-int classify_phase(struct phase_profile *phase, uint64_t perf)
+int classify_phase(struct powgov_runtime *runtime, struct phase_profile *phase, uint64_t perf)
 {
 	int i = -1;
 	int minidx = -1;
 	double mindist = DBL_MAX;
 	double freq = ((double) perf) / 10.0;
+	struct phase_profile *prof_class = runtime->classifier->prof_class;
 	prof_class[0].ipc = freq * CLASS_CPU_SLOPE_IPC + CLASS_CPU_INTERCEPT_IPC;
 	prof_class[0].epc = freq * CLASS_CPU_SLOPE_EPC + CLASS_CPU_INTERCEPT_EPC;
 	prof_class[1].ipc = freq * CLASS_MEM_SLOPE_IPC + CLASS_MEM_INTERCEPT_IPC;
@@ -609,7 +718,7 @@ int classify_phase(struct phase_profile *phase, uint64_t perf)
 	prof_class[3].epc = freq * CLASS_MIX_SLOPE_EPC + CLASS_MIX_INTERCEPT_EPC;
 	for (i = 0; i < NUM_CLASSES; i++)
 	{
-		double dist = metric_distance(phase, &prof_class[i], &prof_maximums, &prof_minimums);
+		double dist = metric_distance(phase, &prof_class[i], &runtime->classifier->prof_maximums, &runtime->classifier->prof_minimums);
 		if (dist < mindist)
 		{
 			mindist = dist;
@@ -631,104 +740,103 @@ int classify_phase(struct phase_profile *phase, uint64_t perf)
 	return minidx;
 }
 
-void classify_and_react(int phase, double this_avgfrq, double this_ipc, char wasthrottled, uint64_t perf)
+void classify_and_react(struct powgov_runtime *runtime, int phase, char wasthrottled, 
+		uint64_t perf)
 {
 	int class;
 	int itr;
+	double exact_target;
+	double ratio;
+	// make these not associated with phase, because all we care about is if it is MEM or not
+	// these should only reset after a CPU phase
+	static unsigned mem_fnreset_ctr = 0;
+	static unsigned mem_fn1_ctr = 0;
+	static unsigned mem_fn2_ctr = 0;
+	static unsigned mem_fn3_ctr = 0;
+	struct phase_profile *profiles = runtime->classifier->profiles;
 	// avoid reclassifying every timestep
 	if (profiles[phase].reclass_count >= RECLASSIFY_INTERVAL)
 	{
-		class = classify_phase(&profiles[phase], perf);
+		class = classify_phase(runtime, &profiles[phase], perf);
 	}
 	else
 	{
 		class = profiles[phase].class;
 		profiles[phase].reclass_count++;
 	}
-	switch (class)
+	if (MAN_CTRL)
 	{
-		case CLASS_CPU:
-			// is CPU phase
-			set_perf(TEMP_PSTATE);
-			/*
-			if (wasthrottled) 
-			{ 
-				set_perf(profiles[phase].frq_target - 1); 
-				if (perf < profiles[phase].frq_target) 
-				{ 
-					profiles[phase].frq_target--; 
-				} 
-				profiles[phase].unthrot_count = 0; 
-			} 
-			else 
-			{ 
-				if (perf > profiles[phase].frq_target) 
-				{ 
-					profiles[phase].frq_target++; 
-				} 
-				if (profiles[phase].frq_target < MAX_PSTATE && 
-					profiles[phase].unthrot_count >= FUP_TIMEOUT) 
-				{ 
-					profiles[phase].frq_target++; 
-				} 
-				profiles[phase].unthrot_count++; 
-				set_perf(profiles[phase].frq_target); 
-			} 
-			*/
-			break;
-		case CLASS_MEM:
-			// is MEM phase
-			set_perf(TEMP_PSTATE);
-			/* if (wasthrottled) */
-			/* { */
-			/* 	// drop frequency directly */
-			/* 	set_perf(profiles[phase].frq_target - 1); */
-			/* 	if (perf < profiles[phase].frq_target) */
-			/* 	{ */
-			/* 		profiles[phase].frq_target--; */
-			/* 	} */
-			/* 	profiles[phase].unthrot_count = 0; */
-			/* } */
-			/* else */
-			/* { */
-			/* 	profiles[phase].frq_target = (uint16_t)  */
-			/* 			(MAX_PSTATE * (powlim / TDP_SORTA) * 1.20); */
-			/* 	set_perf(profiles[phase].frq_target); */
-			/* } */
-			break;
-		case CLASS_IO:
-			// is IO phase
-			set_perf((uint32_t) (MAX_NON_TURBO * 10)); // seems counterintiutive but, yes, this should be high
-			break;
-		case CLASS_MIX:
-			// is MIXED phase
-			set_perf(TEMP_PSTATE);
-			/*
-			if (wasthrottled)
+		if (class == CLASS_CPU)
+		{
+			mem_fnreset_ctr = 0;
+			mem_fn1_ctr = 0;
+			mem_fn2_ctr = 0;
+			mem_fn3_ctr = 0;
+		}
+		if (wasthrottled)
+		{
+			set_perf(runtime, profiles[phase].frq_target - 1);
+			if (perf < profiles[phase].frq_target)
 			{
-				set_perf((unsigned) (profiles[phase].avg_frq * 10) - FDELTA);
+				profiles[phase].frq_target--;
+			}
+			profiles[phase].unthrot_count = 0;
+		}
+		else if (class != CLASS_CPU)
+		{
+			if (mem_fn1_ctr < MEM_FN1_LIM)
+			{
+				profiles[phase].frq_target = 0x22;
+				mem_fn1_ctr++;
+				set_perf(runtime, profiles[phase].frq_target);
+			}
+			else if (mem_fn2_ctr < MEM_FN2_LIM)
+			{
+				profiles[phase].frq_target = 0x28;
+				mem_fn2_ctr++;
+				set_perf(runtime, profiles[phase].frq_target);
+			}
+			else if (mem_fn3_ctr < MEM_FN3_LIM)
+			{
+				profiles[phase].frq_target = 0x2B;
+				mem_fn3_ctr++;
+				set_perf(runtime, profiles[phase].frq_target);
+			}
+			else
+			{
+				profiles[phase].frq_target = 0x2D;
+				set_perf(runtime, profiles[phase].frq_target);
+			}
+			/* if (mem_fnreset_ctr > MEM_FNRESET_LIM) */
+			/* { */
+			/* 	mem_fn1_ctr = 0; */
+			/* 	mem_fn2_ctr = 0; */
+			/* 	mem_fn3_ctr = 0; */
+			/* 	mem_fnreset_ctr = 0; */
+			/* } */
+			/* mem_fnreset_ctr++; */
+		}
+		else
+		{
+			if (perf > profiles[phase].frq_target && profiles[phase].frq_target < runtime->sys->max_pstate)
+			{
+				profiles[phase].frq_target++;
+			}
+			if (profiles[phase].frq_target < runtime->sys->max_pstate &&
+				profiles[phase].unthrot_count >= FUP_TIMEOUT)
+			{
+				profiles[phase].frq_target++;
+				// TODO may want to have separate counter for this, timeout before each freq increase
+				// although not wrong because self throttling...
 				profiles[phase].unthrot_count = 0;
 			}
 			else
 			{
-				if (profiles[phase].unthrot_count > FUP_TIMEOUT)
-				{
-					set_perf((unsigned) (profiles[phase].avg_frq * 10) + FDELTA * 2);
-				}
-				else
-				{
-					set_perf((unsigned) (profiles[phase].avg_frq * 10) + FDELTA);
-				}
+				profiles[phase].unthrot_count++;
 			}
-			*/
-			break;
-		default:
-			printf("ERROR: no phase classification\n");
-			profiles[phase].class = CLASS_UNKNOWN;
-			break;
+			set_perf(runtime, profiles[phase].frq_target);
+		}
 	}
-	profiles[phase].last_ipc = this_ipc;
-	profiles[phase].last_avgfrq = this_avgfrq;
 }
 
 double ipc_scale(double ipc_unscaled, double frq_source, double frq_target)
@@ -787,13 +895,6 @@ void frequency_scale_phase(struct phase_profile *unscaled_profile, double frq_so
 	{
 		scaled_profile->epc = 0.0;
 	}
-	if (scaled_profile->ipc > 4.0 || scaled_profile->epc > 4.0)
-	{
-		printf("\nfrq source %lf, frq target %lf\n", frq_source, frq_target);
-		printf("ipc scale from %lf to %lf\nepc scaled from %lf to %lf\n", unscaled_profile->ipc, scaled_profile->ipc,
-				unscaled_profile->epc, scaled_profile->epc);
-		printf("ipc percent %lf, epc percent %lf\n", ipc_percent, epc_percent);
-	}
 #ifdef DEBUG
 	printf("\nfrq source %lf, frq target %lf\n", frq_source, frq_target);
 	printf("ipc scale from %lf to %lf\nepc scaled from %lf to %lf\n", unscaled_profile->ipc, scaled_profile->ipc,
@@ -802,48 +903,47 @@ void frequency_scale_phase(struct phase_profile *unscaled_profile, double frq_so
 #endif
 }
 
-int branch_same_phase(struct phase_profile *this_profile, uint64_t perf, char wasthrottled,
-		char isthrottled, double phase_avgfrq)
+int branch_same_phase(struct powgov_runtime *runtime, struct phase_profile *this_profile, 
+		uint64_t perf, char wasthrottled, char isthrottled, double phase_avgfrq)
 {
-	if (recentphase < 0)
+	if (runtime->classifier->recentphase < 0)
 	{
 		return 0;
 	}
 
 	struct phase_profile scaled_profile = *this_profile;
 	double dist_to_recent;
-	frequency_scale_phase(this_profile, phase_avgfrq, profiles[recentphase].avg_frq, &scaled_profile);
-	dist_to_recent = metric_distance(&scaled_profile, &profiles[recentphase], &prof_maximums, &prof_minimums);
+	struct phase_profile *profiles = runtime->classifier->profiles;
+	frequency_scale_phase(this_profile, phase_avgfrq, profiles[runtime->classifier->recentphase].avg_frq, &scaled_profile);
+	dist_to_recent = metric_distance(&scaled_profile, &profiles[runtime->classifier->recentphase], &runtime->classifier->prof_maximums, &runtime->classifier->prof_minimums);
 
-	if (dist_to_recent < DIST_THRESH)
+	if (dist_to_recent < runtime->classifier->dist_thresh)
 	{
 #ifdef DEBUG
 		printf("Phase has not changed, dist to recent %lf\n", dist_to_recent);
 #endif
 		// we are in the same phase, update it
-		update_profile(&scaled_profile, recentphase, perf, wasthrottled, phase_avgfrq, recentphase);
-		if (MAN_CTRL)
-		{
-			classify_and_react(recentphase, phase_avgfrq, this_profile->ipc, wasthrottled, perf);
-		}
+		update_profile(runtime, &scaled_profile, runtime->classifier->recentphase, perf, wasthrottled, phase_avgfrq, runtime->classifier->recentphase);
+		classify_and_react(runtime, runtime->classifier->recentphase, wasthrottled, perf);
 		return 1;
 	}
 #ifdef DEBUG
 	printf("Phase has changed, dist to recent %lf\n", dist_to_recent);
 	printf("\trecent phase id %d: ipc %lf, epc %lf, freq %lf. new phase: ipc %lf, epc %lf, freq %lf\n",
-		recentphase, profiles[recentphase].ipc, profiles[recentphase].epc, profiles[recentphase].avg_frq,
+		runtime->classifier->recentphase, profiles[runtime->classifier->recentphase].ipc, profiles[runtime->classifier->recentphase].epc, profiles[runtime->classifier->recentphase].avg_frq,
 		this_profile->ipc, this_profile->epc, phase_avgfrq);
 #endif
 	return 0;
 }
 
-int branch_change_phase(struct phase_profile *this_profile, uint64_t perf, char wasthrottled,
-		char isthrottled, double phase_avgfrq)
+int branch_change_phase(struct powgov_runtime *runtime, struct phase_profile *this_profile, 
+		uint64_t perf, char wasthrottled, char isthrottled, double phase_avgfrq)
 {
 	// we are in a different phase so search for the best match
 	double distances[MAX_PROFILES];
 	int k;
-	for (k = 0; k < numphases; k++)
+	struct phase_profile *profiles = runtime->classifier->profiles;
+	for (k = 0; k < runtime->classifier->numphases; k++)
 	{
 		distances[k] = DBL_MAX;
 	}
@@ -862,16 +962,16 @@ int branch_change_phase(struct phase_profile *this_profile, uint64_t perf, char 
 	int numunder = 0;
 	int min_idx = -1;
 	int i;
-	for (i = 0; i < numphases; i++)
+	for (i = 0; i < runtime->classifier->numphases; i++)
 	{
 		// measure the distance to every known phase
-		if (i == recentphase)
+		if (i == runtime->classifier->recentphase)
 		{
 			continue;
 		}
 		struct phase_profile scaled_profile;
 		frequency_scale_phase(this_profile, phase_avgfrq, profiles[i].avg_frq, &scaled_profile);
-		distances[i] = metric_distance(&scaled_profile, &profiles[i], &prof_maximums, &prof_minimums);
+		distances[i] = metric_distance(&scaled_profile, &profiles[i], &runtime->classifier->prof_maximums, &runtime->classifier->prof_minimums);
 
 		if (distances[i] < min_dist)
 		{
@@ -879,7 +979,7 @@ int branch_change_phase(struct phase_profile *this_profile, uint64_t perf, char 
 			min_idx = i;
 			min_scaled_profile = scaled_profile;
 		}
-		if (distances[i] < DIST_THRESH)
+		if (distances[i] < runtime->classifier->dist_thresh)
 		{
 			numunder++;
 		}
@@ -887,51 +987,49 @@ int branch_change_phase(struct phase_profile *this_profile, uint64_t perf, char 
 
 #ifdef DEBUG
 	int q;
-	for (q = 0; q < numphases; q++)
+	for (q = 0; q < runtime->classifier->numphases; q++)
 	{
-		printf("distance from %d to %d is %lf\n", numphases, q, distances[q]);
+		printf("distance from %d to %d is %lf\n", runtime->classifier->numphases, q, distances[q]);
 	}
 #endif
 
-	if (min_idx >= 0 && min_dist < DIST_THRESH)
+	if (min_idx >= 0 && min_dist < runtime->classifier->dist_thresh)
 	{
 		// we found an existing phase which matches the currently executing workload
 #ifdef DEBUG
 		printf("Found existing phase, with distance %lf\n", min_dist);
 #endif
-		update_profile(&min_scaled_profile, min_idx, perf, isthrottled, phase_avgfrq, recentphase);
-		recentphase = min_idx;
-		if (MAN_CTRL)
-		{
-			classify_and_react(recentphase, phase_avgfrq, this_profile->ipc, wasthrottled, perf);
-		}
+		update_profile(runtime, &min_scaled_profile, min_idx, perf, isthrottled, phase_avgfrq, runtime->classifier->recentphase);
+		runtime->classifier->recentphase = min_idx;
+		classify_and_react(runtime, runtime->classifier->recentphase, wasthrottled, perf);
 	}
 	else
 	{
 		// the currently executing workload has never been seen before
-		if (numphases >= MAX_PROFILES)
+		if (runtime->classifier->numphases >= MAX_PROFILES)
 		{
 			printf("ERROR: out of profile storage, increase the limit or change the sensitivity\n");
 			return -1;
 		}
 		// add new phase
-		add_profile(this_profile, perf, isthrottled, phase_avgfrq, recentphase);
-		recentphase = numphases - 1;
+		add_profile(runtime, this_profile, perf, isthrottled, phase_avgfrq, runtime->classifier->recentphase);
+		runtime->classifier->recentphase = runtime->classifier->numphases - 1;
 	}
 
 	// if there are many matches, we should combine similar phases
 	if (numunder > 0)
 	{
-		agglomerate_profiles();
+		agglomerate_profiles(runtime);
 	}
 }
 
-void pow_aware_perf()
+void pow_aware_perf(struct powgov_runtime *runtime)
 {
 	static uint64_t begin_aperf = 0, begin_mperf = 0;
 	static uint64_t last_aperf = 0, last_mperf = 0;
 	static uint64_t tsc_timer = 0;
 	static uint64_t phase_start_tsc = 0;
+	struct phase_profile *profiles = runtime->classifier->profiles;
 
 	if (last_aperf == 0)
 	{
@@ -947,18 +1045,18 @@ void pow_aware_perf()
 	read_msr_by_coord(0, 0, 0, MSR_IA32_MPERF, &mperf);
 	read_msr_by_coord(0, 0, 0, MSR_IA32_APERF, &aperf);
 
-	uint64_t this_instret = thread_samples[0][SAMPLECTRS[0]].instret - thread_samples[0][SAMPLECTRS[0] - 1].instret;
-	uint64_t this_cycle = thread_samples[0][SAMPLECTRS[0]].tsc_data - thread_samples[0][SAMPLECTRS[0] - 1].tsc_data;
-	unsigned this_throttle = (thread_samples[0][SAMPLECTRS[0]].rapl_throttled & 0xFFFFFFFF) -
-			(thread_samples[0][SAMPLECTRS[0] - 1].rapl_throttled & 0xFFFFFFFF);
-	uint64_t this_llcmiss = thread_samples[0][SAMPLECTRS[0]].llcmiss - thread_samples[0][SAMPLECTRS[0] - 1].llcmiss;
-	uint64_t this_restalls = thread_samples[0][SAMPLECTRS[0]].restalls - thread_samples[0][SAMPLECTRS[0] - 1].restalls;
-	uint64_t this_exstalls = thread_samples[0][SAMPLECTRS[0]].exstalls - thread_samples[0][SAMPLECTRS[0] - 1].exstalls;
-	uint64_t this_branchret = thread_samples[0][SAMPLECTRS[0]].branchret - thread_samples[0][SAMPLECTRS[0] - 1].branchret;
+	uint64_t this_instret = runtime->sampler->new_sample.instret - runtime->sampler->prev_sample.instret;
+	uint64_t this_cycle = runtime->sampler->new_sample.tsc_data - runtime->sampler->prev_sample.tsc_data;
+	unsigned this_throttle = (runtime->sampler->new_sample.rapl_throttled & 0xFFFFFFFF) -
+			(runtime->sampler->prev_sample.rapl_throttled & 0xFFFFFFFF);
+	uint64_t this_llcmiss = runtime->sampler->new_sample.llcmiss - runtime->sampler->prev_sample.llcmiss;
+	uint64_t this_restalls = runtime->sampler->new_sample.restalls - runtime->sampler->prev_sample.restalls;
+	uint64_t this_exstalls = runtime->sampler->new_sample.exstalls - runtime->sampler->prev_sample.exstalls;
+	uint64_t this_branchret = runtime->sampler->new_sample.branchret - runtime->sampler->prev_sample.branchret;
 
-	double total_avgfrq = ((double) (aperf - begin_aperf) / (double) (mperf - begin_mperf)) * MAX_NON_TURBO;
-	double phase_avgfrq = ((double) (aperf - last_aperf) / (double) (mperf - last_mperf)) * MAX_NON_TURBO;
-	uint64_t perf = ((thread_samples[0][SAMPLECTRS[0]].frq_data & 0xFFFFul) >> 8);
+	double total_avgfrq = ((double) (aperf - begin_aperf) / (double) (mperf - begin_mperf)) * runtime->sys->max_non_turbo;
+	double phase_avgfrq = ((double) (aperf - last_aperf) / (double) (mperf - last_mperf)) * runtime->sys->max_non_turbo;
+	uint64_t perf = ((runtime->sampler->new_sample.frq_data & 0xFFFFul) >> 8);
 
 	struct phase_profile this_profile;
 
@@ -968,28 +1066,29 @@ void pow_aware_perf()
 	this_profile.epc = ((double) this_exstalls) / ((double) this_cycle); // execution stalls per cycle
 	this_profile.bpc = ((double) this_branchret) / ((double) this_cycle); // branch instructions retired per cycle
 
-	update_minmax(&this_profile, &prof_maximums, &prof_minimums);
+	update_minmax(&this_profile, &runtime->classifier->prof_maximums, 
+			&runtime->classifier->prof_minimums);
 
-	if (numphases >= MAX_PROFILES)
+	if (runtime->classifier->numphases >= MAX_PROFILES)
 	{
-		remove_unused();
+		remove_unused(runtime);
 	}
 
-	if (numphases == 0)
+	if (runtime->classifier->numphases == 0)
 	{
-		add_profile(&this_profile, perf, 0, phase_avgfrq, recentphase);
+		add_profile(runtime, &this_profile, perf, 0, phase_avgfrq, runtime->classifier->recentphase);
 		return;
 	}
 	// we do phase analysis
 	// if current execution is similar to previously seen phase, update that phase
 	// check to see if we are in the same phase
-	if (recentphase > numphases)
+	if (runtime->classifier->recentphase > runtime->classifier->numphases)
 	{
 		//printf("recent phase no longer exists\n");
-		recentphase = -1;
+		runtime->classifier->recentphase = -1;
 	}
 
-	uint64_t limreasons = thread_samples[0][SAMPLECTRS[0]].perflimit;
+	uint64_t limreasons = runtime->sampler->new_sample.perflimit;
 	char isthrottled = 0;
 	char wasthrottled = 0;
 	if (limreasons & LIMIT_LOG_RAPL)
@@ -1003,22 +1102,22 @@ void pow_aware_perf()
 	}
 
 	// we may be in the same phase
-	if (branch_same_phase(&this_profile, perf, wasthrottled, isthrottled, phase_avgfrq))
+	if (branch_same_phase(runtime, &this_profile, perf, wasthrottled, isthrottled, phase_avgfrq))
 	{
 		return;
 	}
 	// the phase changed
-	if (profiles[recentphase].avg_cycle < (thread_samples[0][SAMPLECTRS[0]].tsc_data - phase_start_tsc))
+	if (profiles[runtime->classifier->recentphase].avg_cycle < (runtime->sampler->new_sample.tsc_data - phase_start_tsc))
 	{
-		profiles[recentphase].avg_cycle = (thread_samples[0][SAMPLECTRS[0]].tsc_data - phase_start_tsc);
+		profiles[runtime->classifier->recentphase].avg_cycle = (runtime->sampler->new_sample.tsc_data - phase_start_tsc);
 	}
-	phase_start_tsc = thread_samples[0][SAMPLECTRS[0]].tsc_data;
+	phase_start_tsc = runtime->sampler->new_sample.tsc_data;
 	last_aperf = aperf;
 	last_mperf = mperf;
-	branch_change_phase(&this_profile, perf, wasthrottled, isthrottled, phase_avgfrq);
+	branch_change_phase(runtime, &this_profile, perf, wasthrottled, isthrottled, phase_avgfrq);
 }
 
-void set_perf(const unsigned freq)
+void set_perf(struct powgov_runtime *runtime, const unsigned freq)
 {
 	uint64_t perf_ctl = 0x0ul;
 	uint64_t freq_mask = freq;
@@ -1029,7 +1128,7 @@ void set_perf(const unsigned freq)
 	//write_msr_by_coord(0, tid, 0, IA32_PERF_CTL, perf_ctl);
 	//write_msr_by_coord(0, tid, 1, IA32_PERF_CTL, perf_ctl);
 	int i;
-	for (i = 0; i < NUM_CPU; i++)
+	for (i = 0; i < runtime->sys->num_cpu; i++)
 	{
 		write_msr_by_coord(0, i, 0, IA32_PERF_CTL, perf_ctl);
 		//write_msr_by_coord(0, i, 1, IA32_PERF_CTL, perf_ctl);
@@ -1038,17 +1137,18 @@ void set_perf(const unsigned freq)
 	}
 }
 
-void dump_phaseinfo(FILE *outfile, double *avgrate)
+void dump_phaseinfo(struct powgov_runtime *runtime, FILE *outfile, double *avgrate)
 {
 	int i;
 	uint64_t recorded_steps = 0;
-	for (i = 0; i < numphases; i++)
+	struct phase_profile *profiles = runtime->classifier->profiles;
+	for (i = 0; i < runtime->classifier->numphases; i++)
 	{
 		recorded_steps += profiles[i].occurrences;
 	}
 	double totaltime = 0.0;
 	double totalpct = 0.0;
-	for (i = 0; i < numphases; i++)
+	for (i = 0; i < runtime->classifier->numphases; i++)
 	{
 		double pct = (double) profiles[i].occurrences / (double) recorded_steps;
 		if (avgrate != NULL)
@@ -1061,24 +1161,24 @@ void dump_phaseinfo(FILE *outfile, double *avgrate)
 	}
 	if (avgrate != NULL)
 	{
-		totalpct = (double) recorded_steps / (double) SAMPLECTRS[0];
+		totalpct = (double) recorded_steps / (double) runtime->sampler->samplectrs[0];
 		fprintf(outfile, "TOTAL\t\t%.2lf\t(%3.2lf%% accounted)\n", totaltime, totalpct * 100.0);
 	}
-	fprintf(outfile, "min instructions per cycle        %lf\n", prof_minimums.ipc);
-	fprintf(outfile, "min LLC misses per cycle          %lf\n", prof_minimums.mpc);
-	fprintf(outfile, "min resource stalls per cycle     %lf\n", prof_minimums.rpc);
-	fprintf(outfile, "min execution stalls per cycle    %lf\n", prof_minimums.epc);
-	fprintf(outfile, "min branch instructions per cycle %lf\n", prof_minimums.bpc);
-	fprintf(outfile, "max instructions per cycle        %lf\n", prof_maximums.ipc);
-	fprintf(outfile, "max LLC misses per cycle          %lf\n", prof_maximums.mpc);
-	fprintf(outfile, "max resource stalls per cycle     %lf\n", prof_maximums.rpc);
-	fprintf(outfile, "max execution stalls per cycle    %lf\n", prof_maximums.epc);
-	fprintf(outfile, "max branch instructions per cycle %lf\n", prof_maximums.bpc);
-	for (i = 0; i < numphases; i++)
+	fprintf(outfile, "min instructions per cycle        %lf\n", runtime->classifier->prof_minimums.ipc);
+	fprintf(outfile, "min LLC misses per cycle          %lf\n", runtime->classifier->prof_minimums.mpc);
+	fprintf(outfile, "min resource stalls per cycle     %lf\n", runtime->classifier->prof_minimums.rpc);
+	fprintf(outfile, "min execution stalls per cycle    %lf\n", runtime->classifier->prof_minimums.epc);
+	fprintf(outfile, "min branch instructions per cycle %lf\n", runtime->classifier->prof_minimums.bpc);
+	fprintf(outfile, "max instructions per cycle        %lf\n", runtime->classifier->prof_maximums.ipc);
+	fprintf(outfile, "max LLC misses per cycle          %lf\n", runtime->classifier->prof_maximums.mpc);
+	fprintf(outfile, "max resource stalls per cycle     %lf\n", runtime->classifier->prof_maximums.rpc);
+	fprintf(outfile, "max execution stalls per cycle    %lf\n", runtime->classifier->prof_maximums.epc);
+	fprintf(outfile, "max branch instructions per cycle %lf\n", runtime->classifier->prof_maximums.bpc);
+	for (i = 0; i < runtime->classifier->numphases; i++)
 	{
 		// ignore phases that are less than x% of program
 		double pct = (double) profiles[i].occurrences / (double) recorded_steps;
-		if (pct < PCT_THRESH)
+		if (pct < runtime->classifier->pct_thresh)
 		{
 			continue;
 		}
@@ -1115,32 +1215,33 @@ void dump_phaseinfo(FILE *outfile, double *avgrate)
 		fprintf(outfile, "\tclass %s\n", CLASS_NAMES[profiles[i].class]);
 
 		int j;
-		for (j = 0; j < numphases; j++)
+		for (j = 0; j < runtime->classifier->numphases; j++)
 		{
 			double lpct = (double) profiles[j].occurrences / (double) recorded_steps;
-			if (lpct > PCT_THRESH)
+			if (lpct > runtime->classifier->pct_thresh)
 			{
 				struct phase_profile scaled_profile;
 				frequency_scale_phase(&profiles[j], profiles[j].avg_frq, profiles[i].avg_frq, &scaled_profile);
-				double dist = metric_distance(&scaled_profile, &profiles[i], &prof_maximums, &prof_minimums);
+				double dist = metric_distance(&scaled_profile, &profiles[i], &runtime->classifier->prof_maximums, &runtime->classifier->prof_minimums);
 				fprintf(outfile, "\tdistance from %d: %lf\n", j, dist);
 			}
 		}
 	}
 }
 
-void dump_data(FILE **outfile, double durctr)
+void dump_data(struct powgov_runtime *runtime, FILE **outfile, double durctr)
 {
-	unsigned long total_pre = thread_samples[0][2].energy_data;
 	unsigned long total_post = 0;
 	unsigned long mid_pow = 0;
+	struct data_sample **thread_samples = runtime->sampler->thread_samples;
+	unsigned long total_pre = thread_samples[0][2].energy_data;
 	int powovf = 0;
 	int j;
 	for (j = 0; j < THREADCOUNT; j++)
 	{
 		fprintf(outfile[j], "freq\tp-state\ttsc\tpower\trapl-throttle-cycles\tTemp(C)\tCORE_PERF_LIMIT_REASONS\tinstret\tllcmiss\tresource-stall\texec-stall\tbranch-retired\n");
 		unsigned long i;
-		for (i = 0; i < SAMPLECTRS[j]; i++)
+		for (i = 0; i < runtime->sampler->samplectrs[j]; i++)
 		{
 			double time = (thread_samples[j][i + 1].tsc_data - thread_samples[j][i].tsc_data) /
 				((((thread_samples[j][i].frq_data & 0xFFFFul) >> 8) / 10.0) * 1000000000.0);
@@ -1153,8 +1254,9 @@ void dump_data(FILE **outfile, double durctr)
 				((thread_samples[j][i].frq_data & 0xFFFFul) >> 8) / 10.0,
 				(unsigned long long) (thread_samples[j][i].frq_data & 0xFFFFul),
 				//(unsigned long long) (thread_samples[j][i].tsc_data),
-				(unsigned long long) (thread_samples[j][i + 1].tsc_data - thread_samples[j][i].tsc_data),
-				diff * energy_unit / time,
+				(unsigned long long) (thread_samples[j][i + 1].tsc_data - 
+					thread_samples[j][i].tsc_data),
+				diff * runtime->sys->rapl_energy_unit / time,
 				(unsigned long long) ((thread_samples[j][i + 1].rapl_throttled & 0xFFFFFFFF) - (thread_samples[j][i].rapl_throttled & 0xFFFFFFFF)),
 				80 - ((thread_samples[j][i].therm & 0x7F0000) >> 16),
 				(unsigned long) thread_samples[j][i].perflimit,
@@ -1169,22 +1271,24 @@ void dump_data(FILE **outfile, double durctr)
 			{
 				powovf++;
 			}
-			if (i == SAMPLECTRS[j] / 2)
+			if (i == runtime->sampler->samplectrs[j] / 2)
 			{
 				mid_pow = (unsigned long) thread_samples[j][i].energy_data;
 			}
 		}
 	}
-	total_post = thread_samples[0][SAMPLECTRS[0] - 1].energy_data;
+	total_post = thread_samples[0][runtime->sampler->samplectrs[0] - 1].energy_data;
 
-	fprintf(sreport, "total power %lf\n", ((total_post - total_pre) * energy_unit) / durctr);
-	fprintf(sreport, "mid power %lf\n", ((total_post - mid_pow) * energy_unit) / (durctr / 2.0));
-	//fprintf(sreport, "hex pre %lx hex post %lx\n", total_pre, total_post);
-	fprintf(sreport, "total power ovf %lf\n", (0xEFFFFFFF * powovf - total_pre + total_post) / durctr);
-	fprintf(sreport, "energy ctr overflows: %d\n", powovf);
+	fprintf(runtime->files->sreport, "total power %lf\n", ((total_post - total_pre) * 
+				runtime->sys->rapl_energy_unit) / durctr);
+	fprintf(runtime->files->sreport, "mid power %lf\n", ((total_post - mid_pow) * 
+				runtime->sys->rapl_energy_unit) / (durctr / 2.0));
+	//fprintf(runtime->files->sreport, "hex pre %lx hex post %lx\n", total_pre, total_post);
+	fprintf(runtime->files->sreport, "total power ovf %lf\n", (0xEFFFFFFF * powovf - total_pre + total_post) / durctr);
+	fprintf(runtime->files->sreport, "energy ctr overflows: %d\n", powovf);
 }
 
-void set_rapl(unsigned sec, double watts, double pu, double su, unsigned affinity)
+void set_rapl(double sec, double watts, double pu, double su, unsigned affinity)
 {
 	uint64_t power = (unsigned long) (watts / pu);
 	uint64_t seconds;
@@ -1236,35 +1340,44 @@ void set_rapl2(unsigned sec, double watts, double pu, double su, unsigned affini
 
 void hwpstuff()
 {
+	uint64_t rax, rbx, rcx, rdx;
+	rax = rbx = rcx = rdx = 0;
+	cpuid(0x6, &rax, &rbx, &rcx, &rdx);
+	if (rax & (0x1ul << 7) == 0)
+	{
+		printf("\thwp is not supported or disabled\n");
+		return;
+	}
+
 	uint64_t hwp = 0x0;
 	read_msr_by_coord(0, 0, 0, 0x770, &hwp);
-	fprintf(stdout, "hwp %lx %s\n", hwp, (hwp == 0 ? "disabled" : "enabled"));
+	fprintf(stdout, "\thwp %lx %s\n", hwp, (hwp == 0 ? "disabled" : "enabled"));
 	if (hwp != 0)
 	{
 		uint64_t hwp_cap = 0x0;
 		read_msr_by_coord(0, 0, 0, 0x771, &hwp_cap);
-		fprintf( stdout, "hwp cap %lx\n", hwp_cap);
+		fprintf( stdout, "\thwp cap %lx\n", hwp_cap);
 		uint64_t hwp_req = 0x0;
 		read_msr_by_coord(0, 0, 0, 0x772, &hwp_req);
-		fprintf( stdout, "hwp req %lx\n", hwp_req);
+		fprintf( stdout, "\thwp req %lx\n", hwp_req);
 		uint64_t hwp_int = 0x0;
 		read_msr_by_coord(0, 0, 0, 0x773, &hwp_int);
-		fprintf( stdout, "hwp int %lx\n", hwp_int);
+		fprintf( stdout, "\thwp int %lx\n", hwp_int);
 		uint64_t hwp_log_req = 0x0;
 		read_msr_by_coord(0, 0, 0, 0x774, &hwp_log_req);
-		fprintf( stdout, "hwp log req %lx\n", hwp_log_req);
+		fprintf( stdout, "\thwp log req %lx\n", hwp_log_req);
 		uint64_t hwp_stat = 0x0;
 		read_msr_by_coord(0, 0, 0, 0x777, &hwp_stat);
-		fprintf( stdout, "hwp stat %lx\n", hwp_stat);
+		fprintf( stdout, "\thwp stat %lx\n", hwp_stat);
 
 		hwp_req = 0x14150Alu;
 		hwp_log_req = 0x14150Alu;
 		//write_msr_by_coord(0, 0, 0, 0x772, hwp_req);
 		//write_msr_by_coord(0, 0, 0, 0x772, hwp_req);
 		read_msr_by_coord(0, 0, 0, 0x772, &hwp_req);
-		fprintf( stdout, "hwp req %lx\n", hwp_req);
+		fprintf( stdout, "\thwp req %lx\n", hwp_req);
 		read_msr_by_coord(0, 0, 0, 0x774, &hwp_log_req);
-		fprintf( stdout, "hwp log req %lx\n", hwp_log_req);
+		fprintf( stdout, "\thwp log req %lx\n", hwp_log_req);
 	}
 }
 
@@ -1276,31 +1389,31 @@ void signal_exit(int signum)
 	return;
 }
 
-int main(int argc, char **argv)
+void init_sampling(struct powgov_runtime *runtime)
 {
-	if (argc < 12)
+	runtime->sampler->thread_samples = (struct data_sample **) calloc(THREADCOUNT, sizeof(struct data_sample *));
+	runtime->files->sampler_dumpfiles = (FILE **) calloc(THREADCOUNT, sizeof(FILE *));
+	runtime->sampler->numsamples = DURATION * runtime->sampler->sps * 1.1;
+	char fname[FNAMESIZE];
+	int i;
+	for (i = 0; i < THREADCOUNT; i++)
 	{
-		fprintf(stderr, "ERROR: bad arguments\n");
-		//fprintf(stderr, "Usage: ./t <threads> <duration in seconds> <samples per second> <rapl1> <rapl2>\n");
-		return -1;
+		fprintf(runtime->files->sreport, "Allocating for %lu samples\n", 
+				(runtime->sampler->numsamples) + 1);
+		runtime->sampler->thread_samples[i] = (struct data_sample *) 
+			calloc((runtime->sampler->numsamples) + 1, sizeof(struct data_sample));
+		if (runtime->sampler->thread_samples[i] == NULL)
+		{
+			fprintf(stderr, "ERROR: out of memory\n");
+			exit(-1);
+		}
+		snprintf((char *) fname, FNAMESIZE, "core%d.msrdat", i);
+		runtime->files->sampler_dumpfiles[i] = fopen(fname, "w");
 	}
+}
 
-	if (init_msr())
-	{
-		fprintf(stderr, "ERROR: unable to init libmsr\n");
-		return -1;
-	}
-
-	dump_rapl();
-
-	//disable_turbo();
-	enable_turbo();
-	printf("checking hwp\n");
-	hwpstuff();
-	uint64_t misc = 0;
-	read_msr_by_coord(0, 0, 0, 0x1A0, &misc);
-	printf("misc enable %lx\n", misc);
-
+void activate_performance_counters(struct powgov_runtime * runtime)
+{
 	set_all_pmc_ctrl(0x0, 0x43, 0x41, 0x2E, 1); // LLC miss
 	set_all_pmc_ctrl(0x0, 0x43, 0x01, 0xA2, 2); // resource stalls
 	set_all_pmc_ctrl(0x0, 0x43, 0x04, 0xA3, 3); // execution stalls
@@ -1309,107 +1422,10 @@ int main(int argc, char **argv)
 	//set_all_pmc_ctrl(0x0, 0x43, 0x01, 0xC7, 4); // SSE/AVX double precision retired
 	//set_all_pmc_ctrl(0x0, 0x43, 0x04, 0xC5, 3); // branch misses retired
 	enable_pmc();
-
-	sreport = fopen("sreport", "w");
-
-	struct sigaction sighand;
-	memset(&sighand, 0, sizeof(struct sigaction));
-	sighand.sa_handler = signal_exit;
-	sigaction(SIGUSR1, &sighand, NULL);
-
-	sigset_t sset;
-	sigemptyset(&sset);
-	sigaddset(&sset, SIGUSR1);
-	sigprocmask(SIG_UNBLOCK, &sset, NULL);
-
-	THREADCOUNT = (unsigned) atoi(argv[1]);
-	unsigned duration = (unsigned) atoi(argv[2]);
-	unsigned sps = (unsigned) atoi(argv[3]);
-	unsigned srate = (1000.0 / sps) * 1000u;
-	double rapl1 = (double) atof(argv[4]);
-	double rapl2 = (double) atof(argv[5]);
-	DIST_THRESH = (double) atof(argv[6]);
-	PCT_THRESH = (double) atof(argv[7]);
-	NUM_CPU = atoi(argv[9]);
-	MAX_NON_TURBO = (double) atof(argv[10]);
-	MAX_PSTATE = (unsigned long) strtol(argv[11], NULL, 16);
-
-	// TODO: variable set twice
-	/* powlim = rapl1; */
-	if (argv[8][0] == 'c')
-	{
-		MAN_CTRL = 1;
-	}
-	if (MAN_CTRL == 1)
-	{
-		printf("manual control ON\n");
-	}
-	else
-	{
-		printf("manual control OFF\n");
-	}
-	powlim = rapl2;
-	printf("rapl limit 1 %lf, rapl limit 2 %lf\n", rapl1, rapl2);
-
-	uint64_t busy_tsc_pre[NUM_CPU * 2];
-	//uint64_t busy_unh_pre[NUM_CPU * 2];
-	int j;
-	for (j = 0; j < NUM_CPU; j++)
-	{
-		read_msr_by_coord(0, j, 0, IA32_TIME_STAMP_COUNTER, &busy_tsc_pre[j]);
-		read_msr_by_coord(1, j, 0, IA32_TIME_STAMP_COUNTER, &busy_tsc_pre[j + NUM_CPU]);
-		//read_msr_by_coord(0, j, 0, IA32_FIXED_CTR1, &busy_unh_pre[j]);
-		//read_msr_by_coord(1, j, 0, IA32_FIXED_CTR1, &busy_unh_pre[j + NUM_CPU]);
-		write_msr_by_coord(0, j , 0, IA32_FIXED_CTR1, 0x0ul);
-		write_msr_by_coord(1, j , 0, IA32_FIXED_CTR1, 0x0ul);
-	}
-
-	// these are the values at 800MHz, linear regression model based on frequency is used
-	// cpu phase
-	prof_class[0].ipc = 0.576;
-	prof_class[0].mpc = 0.005;
-	prof_class[0].rpc = 0.017;
-	prof_class[0].epc = 0.027;
-	prof_class[0].bpc = 0.0006;
-	// memory phase
-	prof_class[1].ipc = 0.122;
-	prof_class[1].mpc = 0.004;
-	prof_class[1].rpc = 0.118;
-	prof_class[1].epc = 0.427;
-	prof_class[1].bpc = 0.017;
-	// IO/sleep phase (derived)
-	prof_class[2].ipc = 0;
-	prof_class[2].mpc = 0;
-	prof_class[2].rpc = 0;
-	prof_class[2].epc = 0;
-	prof_class[2].bpc = 0;
-	// mixed phase (derived)
-	prof_class[3].ipc = 0.349;
-	prof_class[3].mpc = 0.005;
-	prof_class[3].rpc = 0.06;
-	prof_class[3].epc = 0.25;
-	prof_class[3].bpc = 0.005;
-	cpu_set_t cpus;
-	CPU_ZERO(&cpus);
-	// use the next logical CPU after the number of threads in use
-	// AKA this puts the sampler program on an unused logical core
-	CPU_SET(THREADCOUNT, &cpus);
-	sched_setaffinity(0, sizeof(cpus), &cpus);
-
-	fprintf(sreport, "Using paremeters:\n");
-	fprintf(sreport, "\tThreads: %u\n", THREADCOUNT);
-	fprintf(sreport, "\tTime: %u\n", duration);
-	fprintf(sreport, "\tSamples Per Second: %u\n", sps);
-
-	prof_minimums.ipc = DBL_MAX;
-	prof_minimums.mpc = DBL_MAX;
-	prof_minimums.rpc = DBL_MAX;
-	prof_minimums.epc = DBL_MAX;
-	prof_minimums.bpc = DBL_MAX;
-
+	// enable fixed counters
 	uint64_t ovf_ctrl;
 	int ctr;
-	for (ctr = 0; ctr < THREADCOUNT; ctr++)
+	for (ctr = 0; ctr < runtime->sys->num_cpu; ctr++)
 	{
 		uint64_t perf_global_ctrl;
 		uint64_t fixed_ctr_ctrl;
@@ -1423,82 +1439,347 @@ int main(int argc, char **argv)
 		//write_msr_by_coord(0, ctr, 0, MSR_PKG_PERF_STATUS, 0);
 	}
 
-// This is debug info
-/*
-	uint64_t mod = 0x0;
-	read_msr_by_coord(0, 0, 0, 0x19a, &mod);
-	fprintf(sreport, "mod %lx\n", mod);
-	uint64_t therm = 0x0;
-	read_msr_by_coord(0, 0, 0, 0x19c, &therm);
-	fprintf(sreport, "therm %lx\n", therm);
-	uint64_t power_ctl = 0x0;
-	read_msr_by_coord(0, 0, 0, 0x1FC, &power_ctl);
-	fprintf(sreport, "powctl %lx\n", power_ctl);
-	//power_ctl |= (0x1 << 20);
-	//write_msr_by_coord(0, 0, 0, 0x1FC, power_ctl);
-*/
 
+}
+
+void dump_help()
+{
+	printf("Valid options:\n");
+	printf("\t-r: polling rate in samples per second\n");
+	printf("\t-l: RAPL limit\n");
+	printf("\t-h: hard RAPL limit\n");
+	printf("\t-w: RAPL time window\n");
+	printf("\t-t: clustering sensitivity threshold\n");
+	printf("\t-d: display cutoff for profiles, if argument is missing then profiles are not dumped\n");
+	printf("\t-s: system control, do sampling and profiling only\n");
+	printf("\t-v: verbose\n");
+	printf("\t-h: display this menu\n");
+}
+
+int main(int argc, char **argv)
+{
+	// using libmsr
+	if (init_msr())
+	{
+		fprintf(stderr, "ERROR: unable to init libmsr\n");
+		exit(-1);
+	}
+
+
+	// have this process listen for SIGUSR1 signal
+	struct sigaction sighand;
+	memset(&sighand, 0, sizeof(struct sigaction));
+	sighand.sa_handler = signal_exit;
+	sigaction(SIGUSR1, &sighand, NULL);
+	sigset_t sset;
+	sigemptyset(&sset);
+	sigaddset(&sset, SIGUSR1);
+	sigprocmask(SIG_UNBLOCK, &sset, NULL);
+
+
+	struct powgov_runtime *runtime = calloc(1, sizeof(struct powgov_runtime));;
+	runtime->sys = calloc(1, sizeof(struct powgov_sysconfig));
+	runtime->files = calloc(1, sizeof(struct powgov_files));
+	runtime->sampler = calloc(1, sizeof(struct powgov_sampler));
+	runtime->sampler->samplectrs = (unsigned long *) calloc(THREADCOUNT, sizeof(unsigned long));
+	runtime->classifier = calloc(1, sizeof(struct powgov_classifier));
+	// initialize power governor configurization
+	runtime->sampler->sps = 500; // -r for "rate"
+	double rapl1 = 0.0; // -l for "limit"
+	double rapl2 = 0.0; // -h for "hard limit"
+	double window = 0.0; // -w for "window"
+	runtime->classifier->dist_thresh = 0.25;
+	runtime->classifier->pct_thresh = 0.01;
+	MAN_CTRL = 1; // -s for "system control"
+	THREADCOUNT = 1; // deprecated, no user control
+	// TODO: sampling should just dump every x seconds
+	DURATION = 3000; // deprecated, no user control
+	VERBOSE = 0; // -v for "verbose"
+	EXPERIMENTAL = 0; // -e for experimental
+	REPORT = 0; // -R for report
+	// TODO: these should be read in from a file
+	// these are the values at 800MHz, linear regression model based on frequency is used
+	// cpu phase
+	runtime->classifier->prof_class[0].ipc = 0.576;
+	runtime->classifier->prof_class[0].mpc = 0.005;
+	runtime->classifier->prof_class[0].rpc = 0.017;
+	runtime->classifier->prof_class[0].epc = 0.027;
+	runtime->classifier->prof_class[0].bpc = 0.0006;
+	// memory phase
+	runtime->classifier->prof_class[1].ipc = 0.122;
+	runtime->classifier->prof_class[1].mpc = 0.004;
+	runtime->classifier->prof_class[1].rpc = 0.118;
+	runtime->classifier->prof_class[1].epc = 0.427;
+	runtime->classifier->prof_class[1].bpc = 0.017;
+	// IO/sleep phase (derived)
+	runtime->classifier->prof_class[2].ipc = 0;
+	runtime->classifier->prof_class[2].mpc = 0;
+	runtime->classifier->prof_class[2].rpc = 0;
+	runtime->classifier->prof_class[2].epc = 0;
+	runtime->classifier->prof_class[2].bpc = 0;
+	// mixed phase (derived)
+	runtime->classifier->prof_class[3].ipc = 0.349;
+	runtime->classifier->prof_class[3].mpc = 0.005;
+	runtime->classifier->prof_class[3].rpc = 0.06;
+	runtime->classifier->prof_class[3].epc = 0.25;
+	runtime->classifier->prof_class[3].bpc = 0.005;
+	// minimum values
+	runtime->classifier->prof_minimums.ipc = DBL_MAX;
+	runtime->classifier->prof_minimums.mpc = DBL_MAX;
+	runtime->classifier->prof_minimums.rpc = DBL_MAX;
+	runtime->classifier->prof_minimums.epc = DBL_MAX;
+	runtime->classifier->prof_minimums.bpc = DBL_MAX;
+
+
+	// lookup processor information with CPUID
+	uint64_t rax, rbx, rcx, rdx;
+	rax = rbx = rcx = rdx = 0;
+	cpuid(0x16, &rax, &rbx, &rcx, &rdx);
+	runtime->sys->min_pstate = 8;
+	runtime->sys->max_pstate = ((rbx & 0xFFFFul) / 100);
+	runtime->sys->max_non_turbo = ((rax & 0xFFFFul) / 100);
+	uint64_t coresPerSocket, hyperThreads, sockets;
+	int HTenabled;
+	coresPerSocket = hyperThreads = sockets = HTenabled = 0;
+	cpuid_detect_core_conf(&coresPerSocket, &hyperThreads, &sockets, &HTenabled);
+	// TODO: currently hyper threads are ignored
+	runtime->sys->num_cpu = sockets * coresPerSocket;
+	assert(runtime->sys->num_cpu > 0);
+	assert(runtime->sys->max_pstate > runtime->sys->max_non_turbo);
+	assert(runtime->sys->max_non_turbo > runtime->sys->min_pstate);
+
+
+	// process command line arguments
+	char validargs[] = "rlwLtdsveRh";
+	unsigned char numargs = strlen(validargs);
+	int j;
+	// TODO this sucks
+	for (j = 1; j < argc; j++)
+	{
+		if (argv[j][0] != '-')
+		{
+			continue;
+		}
+		int badarg = 1;
+		int i;
+		for (i = 0; i < numargs; i++)
+		{
+			if (argv[j][1] == validargs[i])
+			{
+				badarg = 0;
+				switch (argv[j][1])
+				{
+					case 'r':
+						if (j + 1 > argc - 1)
+						{
+							printf("Error: value required for argument %s\n", argv[j]);
+							exit(-1);
+						}
+						runtime->sampler->sps = (unsigned) atoi(argv[j+1]);
+						break;
+					case 'l':
+						if (j + 1 > argc - 1)
+						{
+							printf("Error: value required for argument %s\n", argv[j]);
+							exit(-1);
+						}
+						rapl1 = (double) atof(argv[j+1]);
+						break;
+					case 'w':
+						if (j + 1 > argc - 1)
+						{
+							printf("Error: value required for argument %s\n", argv[j]);
+							exit(-1);
+						}
+						window = (double) atof(argv[j+1]);
+						break;
+					case 'L':
+						if (j + 1 > argc - 1)
+						{
+							printf("Error: value required for argument %s\n", argv[j]);
+							exit(-1);
+						}
+						rapl2 = (double) atof(argv[j+1]);
+						break;
+					case 't':
+						if (j + 1 > argc - 1)
+						{
+							printf("Error: value required for argument %s\n", argv[j]);
+							exit(-1);
+						}
+						runtime->classifier->dist_thresh = (double) atof(argv[j+1]);
+						break;
+					case 'd':
+						if (j + 1 > argc - 1)
+						{
+							printf("Error: value required for argument %s\n", argv[j]);
+							exit(-1);
+						}
+						runtime->classifier->pct_thresh = (double) atof(argv[j+1]);
+						break;
+					case 's':
+						MAN_CTRL = 0;	
+						break;
+					case 'v':
+						VERBOSE = 1;
+						break;
+					case 'R':
+						REPORT = 1;
+						break;
+					case 'e':
+						EXPERIMENTAL = 1;
+						break;
+					case 'h':
+					default:
+						dump_help();
+						exit(-1);
+						break;
+				}
+			}
+		}
+		if (badarg)
+		{
+			printf("Error: invalid option %s\n", argv[j]);
+			exit(-1);
+		}
+	}
+
+
+	// finish configuration based on arguments
+	unsigned srate = (1000.0 / runtime->sampler->sps) * 1000u;
+	if (MAN_CTRL)
+	{
+		enable_turbo(runtime);
+		set_perf(runtime, runtime->sys->max_pstate);
+	}
+	activate_performance_counters(runtime);
+
+
+	// bind the power governor to core X
+	cpu_set_t cpus;
+	CPU_ZERO(&cpus);
+	// TODO: make this an option
+	CPU_SET(0, &cpus);
+	sched_setaffinity(0, sizeof(cpus), &cpus);
+
+
+	// setup RAPL
 	uint64_t unit;
 	read_msr_by_coord(0, 0, 0, MSR_RAPL_POWER_UNIT, &unit);
 	uint64_t power_unit = unit & 0xF;
-	double pu = 1.0 / (0x1 << power_unit);
-	//fprintf(stderr, "power unit: %lx\n", power_unit);
+	runtime->sys->rapl_power_unit = 1.0 / (0x1 << power_unit);
 	uint64_t seconds_unit_raw = (unit >> 16) & 0x1F;
-	double su = 1.0 / (0x1 << seconds_unit_raw);
-	seconds_unit = su;
-	fprintf(stderr, "seconds unit: %lx\n", seconds_unit);
-	unsigned eu = (unit >> 8) & 0x1F;
-	energy_unit = 1.0 / (0x1 << eu);
-
-	set_rapl(1, rapl1, pu, su, 0);
-	set_rapl2(100, rapl2, pu, su, 0);
-	if (MAN_CTRL) set_perf(MAX_PSTATE);
-
-	thread_samples = (struct data_sample **) calloc(THREADCOUNT, sizeof(struct data_sample *));
-	FILE **output = (FILE **) calloc(THREADCOUNT, sizeof(FILE *));
-	SAMPLECTRS = (unsigned long *) calloc(THREADCOUNT, sizeof(unsigned long));
-	numsamples = duration * sps * 1.1;
-	char fname[FNAMESIZE];
-	int i;
-	for (i = 0; i < THREADCOUNT; i++)
+	runtime->sys->rapl_seconds_unit = 1.0 / (0x1 << seconds_unit_raw);
+	runtime->sys->rapl_energy_unit = (unit >> 8) & 0x1F;
+	uint64_t powinfo = 0;
+	read_msr_by_coord(0, 0, 0, MSR_PKG_POWER_INFO, &powinfo);
+	double proc_tdp = (powinfo & 0x3FFF) * runtime->sys->rapl_power_unit;
+	printf("powinfo %lx\n", powinfo);
+	if (window > ((powinfo >> 48) & 0x1F))
 	{
-		fprintf(sreport, "Allocating for %lu samples\n", (numsamples) + 1);
-		thread_samples[i] = (struct data_sample *) calloc((numsamples) + 1, sizeof(struct data_sample));
-		if (thread_samples[i] == NULL)
-		{
-			fprintf(stderr, "ERROR: out of memory\n");
-			return -1;
-		}
-		snprintf((char *) fname, FNAMESIZE, "core%d.msrdat", i);
-		output[i] = fopen(fname, "w");
+		printf("WARNING: RAPL 1 time window may be too large\n");
 	}
-	if (MAN_CTRL) set_perf(MAX_PSTATE);
+	if (rapl1 < proc_tdp)
+	{
+		printf("WARNING: RAPL 1 limit may be too small\n");
+	}
+	if (rapl2 < proc_tdp)
+	{
+		printf("WARNING: RAPL 2 limit may be too small\n");
+	}
+	if (rapl1 == 0.0)
+	{
+		rapl1 = proc_tdp;
+	}
+	if (rapl2 == 0.0)
+	{
+		rapl2 = proc_tdp;
+	}
+	set_rapl(window, rapl1, runtime->sys->rapl_power_unit, runtime->sys->rapl_seconds_unit, 0);
+	set_rapl2(100, rapl2, runtime->sys->rapl_power_unit, runtime->sys->rapl_seconds_unit, 0);
 
-	fprintf(stdout, "Initialization complete...\n");
-	//sleep(0.25);
+
+	// print verbose descriptions to stdout
+	if (VERBOSE)
+	{
+		printf("####################\n\tPower Governor v%s\n####################\n", VERSIONSTRING);
+		printf("System Configuration:\n");
+		printf("\tMax frequency %f\n\tBase Frequency %f\n\tSockets %d\n\tCores Per Socket %d\n",
+				runtime->sys->max_pstate / 10.0, runtime->sys->max_non_turbo / 10.0, sockets, coresPerSocket);
+		printf("\tHyperthreads %s\n\tTotal Processors %d\n\tTDP %lf\n", 
+				(hyperThreads ? "enabled" : "disabled"), runtime->sys->num_cpu, proc_tdp);
+		dump_rapl();
+		hwpstuff();
+		uint64_t misc = 0;
+		read_msr_by_coord(0, 0, 0, 0x1A0, &misc);
+		printf("\tmisc enable %lx\n", misc);
+		printf("Power Governor Configuration:\n");
+		printf("\trapl limit 1 %lf\n\trapl limit 2 %lf\n\trapl limit 1 time window\n", rapl1, rapl2, window);
+		printf("\tsamples per second %u\n", runtime->sampler->sps);
+		printf("\tgovernor bound to core %d\n", runtime->sys->num_cpu);
+		if (MAN_CTRL == 1)
+		{
+			printf("\tgovernor frequency control ON\n");
+		}
+		else
+		{
+			printf("\tgovernor frequency control OFF\n");
+		}
+	}
+
+
+	// begin sampling if argument present
+	if (EXPERIMENTAL)
+	{
+		init_sampling(runtime);
+	}
+
+
+	if (VERBOSE)
+	{
+		fprintf(stdout, "Initialization complete...\n");
+	}
+
+
+	// gather initial measurements for report if argument is present
 	uint64_t inst_before, inst_after;
-	read_msr_by_coord(0, 0, 0, IA32_FIXED_CTR0, &inst_before);
 	uint64_t aperf_before, mperf_before;
-	read_msr_by_coord(0, 0, 0, MSR_IA32_APERF, &aperf_before);
-	read_msr_by_coord(0, 0, 0, MSR_IA32_MPERF, &mperf_before);
 	uint64_t ovf_stat;
 	unsigned ovf_ctr = 0;
-
 	double avgrate = 0.0;
 	double durctr = 0.0;
 	double lasttv = 0.0;
 	struct timeval start, current;
 	unsigned samplethread = 0;
-	fprintf(stdout, "Benchmark begin...\n");
+	uint64_t busy_tsc_pre[runtime->sys->num_cpu * 2];
+	if (REPORT)
+	{
+		read_msr_by_coord(0, 0, 0, IA32_FIXED_CTR0, &inst_before);
+		read_msr_by_coord(0, 0, 0, MSR_IA32_APERF, &aperf_before);
+		read_msr_by_coord(0, 0, 0, MSR_IA32_MPERF, &mperf_before);
+		//uint64_t busy_unh_pre[runtime->sys->num_cpu * 2];
+		int j;
+		for (j = 0; j < runtime->sys->num_cpu; j++)
+		{
+			read_msr_by_coord(0, j, 0, IA32_TIME_STAMP_COUNTER, &busy_tsc_pre[j]);
+			read_msr_by_coord(1, j, 0, IA32_TIME_STAMP_COUNTER, &busy_tsc_pre[j + runtime->sys->num_cpu]);
+			//read_msr_by_coord(0, j, 0, IA32_FIXED_CTR1, &busy_unh_pre[j]);
+			//read_msr_by_coord(1, j, 0, IA32_FIXED_CTR1, &busy_unh_pre[j + runtime->sys->num_cpu]);
+			write_msr_by_coord(0, j , 0, IA32_FIXED_CTR1, 0x0ul);
+			write_msr_by_coord(1, j , 0, IA32_FIXED_CTR1, 0x0ul);
+		}
+	
+	}
+
+
+	// the main loop, continues until a SIGUSR1 is recieved
+	uint64_t ovf_ctrl;
 	gettimeofday(&start, NULL);
-	//gettimeofday(&current, NULL);
-	sample_data(0);
-	//sample_data(6);
+	sample_data(runtime);
 	usleep(srate);
-	//while (durctr < duration)
 	while (LOOP_CTRL)
 	{
-		sample_data(0);
+		sample_data(runtime);
 		read_msr_by_coord(0, 0, 0, IA32_PERF_GLOBAL_STATUS, &ovf_stat);
 		if (ovf_stat & 0x1)
 		{
@@ -1506,70 +1787,86 @@ int main(int argc, char **argv)
 			write_msr_by_coord(0, 0, 0, IA32_PERF_GLOBAL_OVF_CTRL, ovf_ctrl & 0xFFFFFFFFFFFFFFFE);
 			ovf_ctr++;
 		}
-		pow_aware_perf();
+		pow_aware_perf(runtime);
 		usleep(srate);
 	}
 	gettimeofday(&current, NULL);
+	double exec_time = (double) (current.tv_sec - start.tv_sec) +
+			(current.tv_usec - start.tv_usec) / 1000000.0;
 
-	uint64_t aperf_after, mperf_after;
-	read_msr_by_coord(0, 0, 0, MSR_IA32_APERF, &aperf_after);
-	read_msr_by_coord(0, 0, 0, MSR_IA32_MPERF, &mperf_after);
 
-	read_msr_by_coord(0, 0, 0, IA32_FIXED_CTR0, &inst_after);
-	fprintf(stdout, "Benchmark complete...\n");
-	double aruntime = (double) (current.tv_sec - start.tv_sec) + (current.tv_usec - start.tv_usec) / 1000000.0;
-	avgrate = aruntime / SAMPLECTRS[0];
-	fprintf(sreport, "Actual run time: %f\n", aruntime);
-	fprintf(sreport, "Average Sampling Rate: %lf seconds\n", avgrate);
-	fprintf(sreport, "Dumping data file(s)...\n");
-	fprintf(sreport, "Avg Frq: %f\n", (float) (aperf_after - aperf_before) / (float) (mperf_after - mperf_before) * MAX_NON_TURBO);
-	fprintf(sreport, "Instructions: %lu (ovf %u)\n", inst_after - inst_before, ovf_ctr);
-	fprintf(sreport, "IPS: %lf (ovf %u)\n", (inst_after - inst_before) / aruntime, ovf_ctr);
-	FILE *ins = fopen("instret", "w");
-	fprintf(ins, "%lu (ovf%u)\n", inst_after - inst_before, ovf_ctr);
-	fclose(ins);
-
-	avg_sample_rate = 0.001;
-	dump_data(output, aruntime);
-	for (i = 0; i < 0; i++)
+	if (VERBOSE)
 	{
-		fprintf(sreport, "Thread %d collected %lu samples\n", i, SAMPLECTRS[i]);
-		free(thread_samples[i]);
+		fprintf(stdout, "Power Governor terminating...\n");
 	}
 
-	for (j = 0; j < NUM_CPU; j++)
+
+	// dump all report files if argument present
+	if (REPORT)
 	{
-		uint64_t busy_tsc_post, busy_unh_post;
-		read_msr_by_coord(0, j, 0, IA32_TIME_STAMP_COUNTER, &busy_tsc_post);
-		read_msr_by_coord(0, j, 0, IA32_FIXED_CTR1, &busy_unh_post);
-		double diff_unh = ((double) busy_unh_post);
-		double diff_tsc = ((double) busy_tsc_post - busy_tsc_pre[j]);
-		printf("s1c%d pct busy: %lf\% (%lf/%lf)\n", j,  diff_unh / diff_tsc * 100.0, diff_unh, diff_tsc);
-		read_msr_by_coord(1, j, 0, IA32_TIME_STAMP_COUNTER, &busy_tsc_post);
-		read_msr_by_coord(1, j, 0, IA32_FIXED_CTR1, &busy_unh_post);
-		diff_unh = ((double) busy_unh_post);
-		diff_tsc = ((double) busy_tsc_post - busy_tsc_pre[j + NUM_CPU]);
-		printf("s2c%d pct busy: %lf\% (%lf/%lf)\n", j,  diff_unh / diff_tsc * 100.0, diff_unh, diff_tsc);
+		uint64_t aperf_after, mperf_after;
+		read_msr_by_coord(0, 0, 0, MSR_IA32_APERF, &aperf_after);
+		read_msr_by_coord(0, 0, 0, MSR_IA32_MPERF, &mperf_after);
+
+		read_msr_by_coord(0, 0, 0, IA32_FIXED_CTR0, &inst_after);
+		avgrate = exec_time / runtime->sampler->samplectrs[0];
+		runtime->files->sreport = fopen("sreport", "w");
+		fprintf(runtime->files->sreport, "\tActual run time: %f\n", exec_time);
+		fprintf(runtime->files->sreport, "\tAverage Sampling Rate: %lf seconds\n", avgrate);
+		fprintf(runtime->files->sreport, "\tDumping data file(s)...\n");
+		fprintf(runtime->files->sreport, "\tAvg Frq: %f\n", (float) 
+				(aperf_after - aperf_before) / (float) 
+				(mperf_after - mperf_before) * runtime->sys->max_non_turbo);
+		fprintf(runtime->files->sreport, "\tInstructions: %lu (ovf %u)\n", 
+				inst_after - inst_before, ovf_ctr);
+		fprintf(runtime->files->sreport, "\tIPS: %lf (ovf %u)\n", 
+				(inst_after - inst_before) / exec_time, ovf_ctr);
+		char fname[FNAMESIZE];
+		snprintf((char *) fname, FNAMESIZE, "powgov_profiles");
+		FILE *profout = fopen(fname, "w");
+		// TODO: figure out if miscounts from remove_unused or something else (fixed?)
+		remove_unused(runtime);
+		agglomerate_profiles(runtime);
+		dump_phaseinfo(runtime, profout, &avgrate);
+		int j;
+		for (j = 0; j < runtime->sys->num_cpu; j++)
+		{
+			uint64_t busy_tsc_post, busy_unh_post;
+			read_msr_by_coord(0, j, 0, IA32_TIME_STAMP_COUNTER, &busy_tsc_post);
+			read_msr_by_coord(0, j, 0, IA32_FIXED_CTR1, &busy_unh_post);
+			double diff_unh = ((double) busy_unh_post);
+			double diff_tsc = ((double) busy_tsc_post - busy_tsc_pre[j]);
+			printf("s1c%d pct busy: %lf\% (%lf/%lf)\n", j,  diff_unh / diff_tsc * 100.0, diff_unh, diff_tsc);
+			//read_msr_by_coord(1, j, 0, IA32_TIME_STAMP_COUNTER, &busy_tsc_post);
+			//read_msr_by_coord(1, j, 0, IA32_FIXED_CTR1, &busy_unh_post);
+			//diff_unh = ((double) busy_unh_post);
+			//diff_tsc = ((double) busy_tsc_post - busy_tsc_pre[j + runtime->sys->num_cpu]);
+			//printf("s2c%d pct busy: %lf\% (%lf/%lf)\n", j,  diff_unh / diff_tsc * 100.0, diff_unh, diff_tsc);
+		}
+		fclose(runtime->files->sreport);
+		fclose(runtime->files->profout);
 	}
 
-	snprintf((char *) fname, FNAMESIZE, "profiles %d", i);
-	FILE *profout = fopen(fname, "w");
-	//dump_phaseinfo(stdout, NULL);
-	// TODO: figure out if miscounts from remove_unused or something else (fixed?)
-	remove_unused();
-	agglomerate_profiles();
-	printf("phase results\n");
-	dump_phaseinfo(profout, &avgrate);
 
-	//set_rapl(1, 105.0, pu, su, 0);
-	free(thread_samples);
-	free(output);
-	free(SAMPLECTRS);
+	// dump sampler data if argument present
+	if (EXPERIMENTAL)
+	{
+		dump_data(runtime, runtime->files->sampler_dumpfiles, exec_time);
+		int i;
+		for (i = 0; i < THREADCOUNT; i++)
+		{
+			free(runtime->sampler->thread_samples[i]);
+			fclose(runtime->files->sampler_dumpfiles[i]);
+		}
+		free(runtime->sampler->thread_samples);
+		free(runtime->sampler->samplectrs);
+		free(runtime->files->sampler_dumpfiles);
+	}
 
+
+	// Reset RAPL to defaults
+	set_rapl(1, proc_tdp, runtime->sys->rapl_power_unit, runtime->sys->rapl_seconds_unit, 0);
+	set_rapl2(100, proc_tdp * 1.2, runtime->sys->rapl_power_unit, runtime->sys->rapl_seconds_unit, 0);
 	finalize_msr();
-
-	fprintf(sreport, "Done...\n");
-	fclose(sreport);
-
 	return 0;
 }
